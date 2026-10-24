@@ -1,0 +1,6 @@
+#include? "Version.xcconfig"
+
+TEAM_ID=
+
+PRODUCT_NAME=Lumadeck
+PRODUCT_BUNDLE_IDENTIFIER=com.lumadeck.app.Lumadeck$(TEAM_ID)
