@@ -84,7 +84,7 @@ jobs:
           cat "${gradle_user_home}/gradle.properties"
 
       - name: Prepare iOS dependencies
-        run: ./scripts/prepare-ios-dependencies.sh
+        run: bash ./scripts/prepare-ios-dependencies.sh
 
       - name: Build unsigned full ${{ inputs.configuration }} IPA
         run: |
@@ -99,7 +99,7 @@ jobs:
           ) &
           monitor_pid=$!
           trap 'kill "${monitor_pid}" 2>/dev/null || true' EXIT
-          ./scripts/build-ios-ipa.sh
+          bash ./scripts/build-ios-ipa.sh
 
       - name: Summarize IPA
         run: |
