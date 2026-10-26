@@ -24,6 +24,13 @@ interface NuvioPlayerBridge {
     fun retry()
     fun isPictureInPictureSupported(): Boolean
     fun startPictureInPicture()
+    fun isAirPlaySupported(): Boolean
+    fun presentAirPlayPlayer(
+        videoUrl: String,
+        headersJson: String?,
+        title: String?,
+        startPositionMs: Long,
+    ): Boolean
     fun setVideoZoom(scale: Double)
     fun setExperimentalSinglePrimaryPictureInPictureEnabled(enabled: Boolean)
     fun updateNowPlayingMetadata(

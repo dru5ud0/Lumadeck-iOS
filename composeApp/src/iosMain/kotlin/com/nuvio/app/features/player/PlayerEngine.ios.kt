@@ -66,6 +66,8 @@ actual fun PlatformPlayerSurface(
     val latestOnControllerReady = rememberUpdatedState(onControllerReady)
     val latestOnSnapshot = rememberUpdatedState(onSnapshot)
     val latestOnError = rememberUpdatedState(onError)
+    val latestSourceUrl = rememberUpdatedState(sourceUrl)
+    val latestSourceHeaders = rememberUpdatedState(sourceHeaders)
     val density = LocalDensity.current
     PlayerSettingsRepository.ensureLoaded()
     val playerSettings by PlayerSettingsRepository.uiState.collectAsStateWithLifecycle()
@@ -151,6 +153,24 @@ actual fun PlatformPlayerSurface(
 
             override fun startPictureInPicture() {
                 bridge.startPictureInPicture()
+            }
+
+            override fun showCastDialog() {
+                val headersJson = runCatching {
+                    Json.encodeToString(latestSourceHeaders.value)
+                }.getOrNull()
+                val started = bridge.presentAirPlayPlayer(
+                    videoUrl = latestSourceUrl.value,
+                    headersJson = headersJson,
+                    title = bridge.getProperty("media-title").ifBlank { null },
+                    startPositionMs = bridge.getPositionMs(),
+                )
+                if (started) {
+                    bridge.pause()
+                    InAppLogger.info("Player/AirPlay", "handoff started positionMs=${bridge.getPositionMs()}")
+                } else {
+                    InAppLogger.error("Player/AirPlay", "handoff unavailable")
+                }
             }
 
             override fun setVideoZoom(scale: Float) {
@@ -461,6 +481,7 @@ actual fun PlatformPlayerSurface(
                 videoHeight = bridge.getVideoHeight().coerceAtLeast(0),
                 mediaInfoJson = bridge.getMediaInfoJson(),
                 chapters = chapters,
+                castAvailable = bridge.isAirPlaySupported(),
             )
             latestOnSnapshot.value(snapshot)
             val errorMessage = bridge.getErrorMessage().ifBlank { null }

@@ -13,6 +13,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     private var experimentalSinglePrimaryPictureInPictureEnabled = false
     private var keyboardShortcutsEnabled = true
     private var keyboardShortcutHandler: ((String) -> Void)?
+    private var airPlayPlayerViewController: AirPlayPlayerViewController?
+    private var airPlayPlayer: AVPlayer?
+    private var airPlayStatusObservation: NSKeyValueObservation?
 
     func createPlayerViewController() -> UIViewController {
         return ensurePlayerViewController()
@@ -73,6 +76,82 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     func retry() { playerVC?.retryPlayback() }
     func isPictureInPictureSupported() -> Bool { playerVC?.isPictureInPictureSupported() ?? false }
     func startPictureInPicture() { playerVC?.startPictureInPicture() }
+    func isAirPlaySupported() -> Bool { true }
+
+    func presentAirPlayPlayer(
+        videoUrl: String,
+        headersJson: String?,
+        title: String?,
+        startPositionMs: Int64
+    ) -> Bool {
+        guard let url = URL(string: videoUrl), url.scheme != nil else { return false }
+        guard airPlayPlayerViewController == nil else { return true }
+        let headers = parseRequestHeaders(headersJson)
+        let asset = AVURLAsset(
+            url: url,
+            options: ["AVURLAssetHTTPHeaderFieldsKey": headers]
+        )
+        let item = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+
+        let controller = AirPlayPlayerViewController()
+        controller.player = player
+        controller.showsPlaybackControls = true
+        controller.modalPresentationStyle = .fullScreen
+        if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            controller.title = title
+        }
+        controller.onDismiss = { [weak self] in
+            self?.airPlayPlayer?.pause()
+            self?.airPlayPlayer = nil
+            self?.airPlayPlayerViewController = nil
+            self?.airPlayStatusObservation = nil
+        }
+
+        guard let presenter = playerVC ?? topViewController() else { return false }
+
+        airPlayPlayerViewController = controller
+        airPlayPlayer = player
+        airPlayStatusObservation = item.observe(\.status, options: [.new]) { [weak self, weak controller] item, _ in
+            guard item.status == .failed else { return }
+            let message = item.error?.localizedDescription
+            DispatchQueue.main.async {
+                controller?.dismiss(animated: true)
+                self?.presentAirPlayError(message)
+            }
+        }
+
+        presenter.present(controller, animated: true) {
+            if startPositionMs > 0 {
+                player.seek(to: CMTime(value: startPositionMs, timescale: 1000))
+            }
+            player.play()
+        }
+        return true
+    }
+
+    private func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        var top = scene?.windows.first(where: { $0.isKeyWindow })?.rootViewController
+            ?? scene?.windows.first?.rootViewController
+        while let presented = top?.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+
+    private func presentAirPlayError(_ message: String?) {
+        let alert = UIAlertController(
+            title: "AirPlay playback failed",
+            message: message ?? "This stream is not compatible with the native player. Try an HLS or MP4 source.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        (playerVC ?? topViewController())?.present(alert, animated: true)
+    }
     func setVideoZoom(scale: Double) { playerVC?.setVideoZoom(scale) }
     func setExperimentalSinglePrimaryPictureInPictureEnabled(enabled: Bool) {
         experimentalSinglePrimaryPictureInPictureEnabled = enabled
@@ -2579,5 +2658,17 @@ enum NuvioPlayerRegistration {
     static func register() {
         NuvioPlayerBridgeFactory.shared.registerFactory(creator: MPVPlayerBridgeCreator())
         NuvioSeekPreviewRegistry.shared.registerCreator(creator: FFmpegSeekPreviewGeneratorCreator())
+    }
+}
+
+private final class AirPlayPlayerViewController: AVPlayerViewController {
+    var onDismiss: (() -> Void)?
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        guard isBeingDismissed || presentingViewController == nil else { return }
+        player?.pause()
+        player = nil
+        onDismiss?()
     }
 }
