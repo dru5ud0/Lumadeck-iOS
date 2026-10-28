@@ -8,3 +8,6 @@ package com.nuvio.app.features.servers
  * builds, App Store builds, Android) provisioning is a no-op.
  */
 internal expect suspend fun ensureLumadeckProvisioned()
+
+/** Returns whether this build contains private LumaDeck defaults. */
+internal expect fun hasLumadeckDefaults(): Boolean

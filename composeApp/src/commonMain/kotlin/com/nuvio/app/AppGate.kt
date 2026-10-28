@@ -41,13 +41,15 @@ import com.nuvio.app.core.ui.nuvio
 import com.nuvio.app.features.auth.AuthScreen
 import com.nuvio.app.features.membership.MemberAccessRepository
 import com.nuvio.app.features.profiles.AvatarRepository
+import com.nuvio.app.features.profiles.NuvioProfile
+import com.nuvio.app.features.profiles.PROFILE_COLORS
 import com.nuvio.app.features.profiles.ProfileBiometricAuth
 import com.nuvio.app.features.profiles.ProfileBiometricResult
-import com.nuvio.app.features.profiles.NuvioProfile
 import com.nuvio.app.features.profiles.ProfileEditScreen
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.profiles.ProfileSelectionScreen
 import com.nuvio.app.features.profiles.profileAvatarImageUrl
+import com.nuvio.app.features.servers.hasLumadeckDefaults
 import com.nuvio.app.navigation.AppRoute
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
@@ -460,6 +462,10 @@ internal fun AppGate(
                 }
             }
             is AuthState.Unauthenticated -> {
+                if (hasLumadeckDefaults()) {
+                    AuthRepository.signInAnonymously()
+                    return@LaunchedEffect
+                }
                 if (allowCachedProfileAccess) {
                     enterProfileGate(cachedProfiles, syncOnEnter = false)
                 } else {
@@ -483,6 +489,16 @@ internal fun AppGate(
         val authenticatedState = authState as? AuthState.Authenticated ?: return@LaunchedEffect
         ProfileRepository.ensureLoaded(authenticatedState.userId)
         ProfileRepository.pullProfiles()
+        if (
+            authenticatedState.isAnonymous &&
+            hasLumadeckDefaults() &&
+            ProfileRepository.state.value.profiles.isEmpty()
+        ) {
+            ProfileRepository.createProfile(
+                name = "LumaDeck",
+                avatarColorHex = PROFILE_COLORS.first(),
+            )
+        }
     }
 
     LaunchedEffect(

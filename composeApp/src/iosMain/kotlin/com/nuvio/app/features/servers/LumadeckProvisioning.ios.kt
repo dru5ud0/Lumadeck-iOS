@@ -19,6 +19,10 @@ private val log = Logger.withTag("LumadeckProvisioning")
 private val json = Json { ignoreUnknownKeys = true }
 
 @OptIn(ExperimentalForeignApi::class)
+internal actual fun hasLumadeckDefaults(): Boolean =
+    NSBundle.mainBundle.pathForResource("LumadeckDefaults", ofType = "json") != null
+
+@OptIn(ExperimentalForeignApi::class)
 internal actual suspend fun ensureLumadeckProvisioned() {
     val path = NSBundle.mainBundle.pathForResource("LumadeckDefaults", ofType = "json") ?: return
     val text = NSString.stringWithContentsOfFile(path, NSUTF8StringEncoding, null) ?: return

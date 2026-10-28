@@ -5,9 +5,10 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -26,10 +27,12 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.logging.InAppLogger
+import com.nuvio.app.features.servers.ServerPlayback
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.useContents
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import nuvio.composeapp.generated.resources.Res
@@ -68,6 +71,7 @@ actual fun PlatformPlayerSurface(
     val latestOnError = rememberUpdatedState(onError)
     val latestSourceUrl = rememberUpdatedState(sourceUrl)
     val latestSourceHeaders = rememberUpdatedState(sourceHeaders)
+    val coroutineScope = rememberCoroutineScope()
     val density = LocalDensity.current
     PlayerSettingsRepository.ensureLoaded()
     val playerSettings by PlayerSettingsRepository.uiState.collectAsStateWithLifecycle()
@@ -92,6 +96,7 @@ actual fun PlatformPlayerSurface(
     val controller = remember(bridge) {
         object : PlayerEngineController, PlayerSystemControlSource {
             private var lastAppliedVolume: Float? = null
+            private var airPlayLaunchInProgress = false
             private var lastLoggedAudioTracks: String? = null
 
             override val keepsPlaybackInBackground: Boolean
@@ -156,20 +161,44 @@ actual fun PlatformPlayerSurface(
             }
 
             override fun showCastDialog() {
-                val headersJson = runCatching {
-                    Json.encodeToString(latestSourceHeaders.value)
-                }.getOrNull()
-                val started = bridge.presentAirPlayPlayer(
-                    videoUrl = latestSourceUrl.value,
-                    headersJson = headersJson,
-                    title = bridge.getProperty("media-title").ifBlank { null },
-                    startPositionMs = bridge.getPositionMs(),
-                )
-                if (started) {
-                    bridge.pause()
-                    InAppLogger.info("Player/AirPlay", "handoff started positionMs=${bridge.getPositionMs()}")
-                } else {
-                    InAppLogger.error("Player/AirPlay", "handoff unavailable")
+                if (airPlayLaunchInProgress) return
+                airPlayLaunchInProgress = true
+                coroutineScope.launch {
+                    try {
+                        val originalUrl = latestSourceUrl.value
+                        val serverPlayback = runCatching { ServerPlayback.airPlaySource(originalUrl) }
+                            .onFailure { error ->
+                                InAppLogger.warn(
+                                    "Player/AirPlay",
+                                    "compatible server source unavailable: ${InAppLogger.throwableSummary(error)}",
+                                )
+                            }
+                            .getOrNull()
+                        val headersJson = runCatching {
+                            Json.encodeToString(serverPlayback?.headers ?: latestSourceHeaders.value)
+                        }.getOrNull()
+                        val started = runCatching {
+                            bridge.presentAirPlayPlayer(
+                                videoUrl = serverPlayback?.url ?: originalUrl,
+                                headersJson = headersJson,
+                                title = bridge.getProperty("media-title").ifBlank { null },
+                                startPositionMs = bridge.getPositionMs(),
+                            )
+                        }.onFailure { error ->
+                            InAppLogger.error(
+                                "Player/AirPlay",
+                                "handoff failed: ${InAppLogger.throwableSummary(error)}",
+                            )
+                        }.getOrDefault(false)
+                        if (started) {
+                            bridge.pause()
+                            InAppLogger.info("Player/AirPlay", "handoff started positionMs=${bridge.getPositionMs()}")
+                        } else {
+                            InAppLogger.error("Player/AirPlay", "handoff unavailable")
+                        }
+                    } finally {
+                        airPlayLaunchInProgress = false
+                    }
                 }
             }
 
