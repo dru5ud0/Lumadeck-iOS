@@ -350,9 +350,12 @@ final class AirPlayHLSRelay {
         headers.append("")
         var response = Data(headers.joined(separator: "\r\n").utf8)
         if sendBody { response.append(body) }
-        connection.send(content: response, contentContext: .finalMessage, isComplete: true) { _ in
-            connection.cancel()
-        }
+        connection.send(
+            content: response,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { _ in connection.cancel() }
+        )
     }
 
     // MARK: FFmpeg remux
