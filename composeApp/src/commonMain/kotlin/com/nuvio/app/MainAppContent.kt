@@ -201,6 +201,7 @@ import com.nuvio.app.core.ui.glass.nuvioBackdropSource
 import com.nuvio.app.core.ui.glass.rememberNuvioBackdrop
 import com.nuvio.app.features.servers.ServerMatcher
 import com.nuvio.app.features.servers.ServerRepository
+import com.nuvio.app.features.servers.ensureLumadeckProvisioned
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
@@ -422,6 +423,12 @@ internal fun MainAppContent(
         ServerRepository.ensureLoaded()
         ServerRepository.uiState
     }.collectAsStateWithLifecycle()
+
+    LaunchedEffect(appContentGeneration, profileState.activeProfile?.profileIndex) {
+        if (!ownsAppRuntime) return@LaunchedEffect
+        if (profileState.activeProfile == null) return@LaunchedEffect
+        ensureLumadeckProvisioned()
+    }
 
     LaunchedEffect(appContentGeneration, homeCatalogRefreshKey, serversUiState.revision) {
         if (!ownsAppRuntime) return@LaunchedEffect
