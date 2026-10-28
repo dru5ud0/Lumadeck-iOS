@@ -172,9 +172,29 @@ internal object ServerPlayback {
         val details = description.orEmpty()
         val container = details.substringAfterLast('•').trim().lowercase()
         if (fileExtension !in APPLE_NATIVE_CONTAINERS && container !in APPLE_NATIVE_CONTAINERS) return null
-        val normalized = details.uppercase()
+        val normalized = "$details ${filename.orEmpty()}".uppercase()
         if (INCOMPATIBLE_APPLE_CODECS.any { normalized.contains(it) }) return null
-        return if (PREFERRED_APPLE_CODECS.any { normalized.contains(it) }) 2 else 1
+        val videoScore = when {
+            H264_CODECS.any { normalized.contains(it) } -> 100
+            HEVC_CODECS.any { normalized.contains(it) } -> 80
+            else -> 20
+        }
+        val audioScore = when {
+            normalized.contains("AAC") -> 100
+            normalized.contains("MP3") -> 80
+            DOLBY_AUDIO_CODECS.any { normalized.contains(it) } -> 10
+            else -> 0
+        }
+        val qualityScore = when {
+            normalized.contains("2160P") -> 6
+            normalized.contains("1080P") -> 5
+            normalized.contains("720P") -> 4
+            normalized.contains("576P") -> 3
+            normalized.contains("480P") -> 2
+            normalized.contains("360P") -> 1
+            else -> 0
+        }
+        return videoScore + audioScore + qualityScore
     }
 
     private fun capabilities() = ServerPlayerCapabilities(
@@ -183,7 +203,9 @@ internal object ServerPlayback {
     )
 
     private val APPLE_NATIVE_CONTAINERS = setOf("mp4", "m4v", "mov")
-    private val PREFERRED_APPLE_CODECS = setOf("H264", "H.264", "AVC", "HEVC", "H265", "H.265")
+    private val H264_CODECS = setOf("H264", "H.264", "AVC")
+    private val HEVC_CODECS = setOf("HEVC", "H265", "H.265")
+    private val DOLBY_AUDIO_CODECS = setOf("AC3", "EAC3", "DOLBY", " DD ")
     private val INCOMPATIBLE_APPLE_CODECS = setOf("AV1", "VP8", "VP9")
 
     private class ActivePlayback(

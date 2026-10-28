@@ -117,7 +117,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
         airPlayPlayer = player
         airPlayStatusObservation = item.observe(\.status, options: [.new]) { [weak self, weak controller] item, _ in
             guard item.status == .failed else { return }
-            let message = item.error?.localizedDescription
+            let message = self?.airPlayErrorMessage(item)
             DispatchQueue.main.async {
                 controller?.dismiss(animated: true)
                 self?.presentAirPlayError(message)
@@ -131,6 +131,33 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
             player.play()
         }
         return true
+    }
+
+    private func airPlayErrorMessage(_ item: AVPlayerItem) -> String? {
+        var details: [String] = []
+        if let error = item.error {
+            let nsError = error as NSError
+            details.append(nsError.localizedDescription)
+            details.append("\(nsError.domain) (\(nsError.code))")
+            if let reason = nsError.localizedFailureReason, !reason.isEmpty {
+                details.append(reason)
+            }
+            if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+                details.append("Underlying: \(underlying.domain) (\(underlying.code)) \(underlying.localizedDescription)")
+            }
+        }
+        if let event = item.errorLog()?.events.last {
+            if event.errorStatusCode != 0 {
+                details.append("HTTP/status \(event.errorStatusCode)")
+            }
+            if let comment = event.errorComment, !comment.isEmpty {
+                details.append(comment)
+            }
+        }
+        let unique = details.reduce(into: [String]()) { result, value in
+            if !result.contains(value) { result.append(value) }
+        }
+        return unique.isEmpty ? nil : unique.joined(separator: "\n")
     }
 
     private func topViewController() -> UIViewController? {
