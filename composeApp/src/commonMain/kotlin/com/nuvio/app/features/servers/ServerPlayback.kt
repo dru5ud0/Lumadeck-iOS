@@ -77,28 +77,17 @@ internal object ServerPlayback {
     fun session(url: String?): ServerPlaybackSession? = url?.let { synchronized(lock) { active[it] } }?.playback
 
     /**
-     * Prepares an Apple-native-compatible alternative for an active server stream.
+     * Returns the exact active server stream for an AirPlay handoff.
      *
-     * AIOStreams' Jellyfin facade exposes several direct-play files for the same
-     * title but explicitly does not transcode. Prefer an MP4-family source for
-     * AVPlayer, then a stream-copy-compatible H.264/HEVC source that iOS can remux
-     * locally for AirPlay. The active MPV session remains intact so dismissing
-     * the system player can return to local playback.
+     * The selected media source is part of the user's playback choice. Re-querying
+     * the server and choosing a more Apple-compatible candidate can silently hand
+     * a different file (or incorrectly grouped episode) to AirPlay. AVPlayer tries
+     * this source directly and the iOS bridge can remux the same source when needed.
      */
     suspend fun airPlaySource(url: String?): ServerPlaybackSession? {
         val current = url?.let { synchronized(lock) { active[it] } } ?: return null
-        val itemId = current.playback.target.item.itemId
-        val candidates = current.provider.candidates(current.session, itemId)
-        val target = candidates.mapNotNull { candidate ->
-            candidate.airPlayScore()?.let { score -> candidate to score }
-        }.maxByOrNull { it.second }?.first?.target
-            ?: return current.playback
-        val playback = current.provider.preparePlayback(
-            current.session,
-            ServerPlaybackRequest(target = target, capabilities = capabilities()),
-        )
-        log.i { "Prepared ${current.label} AirPlay source ${target.mediaSourceId}" }
-        return playback
+        log.i { "Using ${current.label} source ${current.playback.mediaSourceId} for AirPlay" }
+        return current.playback
     }
 
     suspend fun newerResumePositionMs(url: String?, savedAtEpochMs: Long?): Long? {
@@ -168,70 +157,10 @@ internal object ServerPlayback {
 
     private fun List<ServerTrack>.selectedIndex(): Int? = firstOrNull { it.selected }?.index
 
-    private fun ServerCandidate.appleNativeScore(): Int? {
-        val fileExtension = filename?.substringAfterLast('.', missingDelimiterValue = "")?.lowercase()
-        val details = description.orEmpty()
-        val container = details.substringAfterLast('•').trim().lowercase()
-        if (fileExtension !in APPLE_NATIVE_CONTAINERS && container !in APPLE_NATIVE_CONTAINERS) return null
-        val normalized = "$details ${filename.orEmpty()}".uppercase()
-        if (INCOMPATIBLE_APPLE_CODECS.any { normalized.contains(it) }) return null
-        val videoScore = when {
-            H264_CODECS.any { normalized.contains(it) } -> 100
-            HEVC_CODECS.any { normalized.contains(it) } -> 80
-            else -> 20
-        }
-        val audioScore = when {
-            normalized.contains("AAC") -> 100
-            normalized.contains("MP3") -> 80
-            DOLBY_AUDIO_CODECS.any { normalized.contains(it) } -> 10
-            else -> 0
-        }
-        val qualityScore = when {
-            normalized.contains("2160P") -> 6
-            normalized.contains("1080P") -> 5
-            normalized.contains("720P") -> 4
-            normalized.contains("576P") -> 3
-            normalized.contains("480P") -> 2
-            normalized.contains("360P") -> 1
-            else -> 0
-        }
-        return videoScore + audioScore + qualityScore
-    }
-
-    private fun ServerCandidate.airPlayScore(): Int? {
-        appleNativeScore()?.let { return NATIVE_CONTAINER_BONUS + it }
-        val fileExtension = filename?.substringAfterLast('.', missingDelimiterValue = "")?.lowercase()
-        val details = description.orEmpty()
-        val container = details.substringAfterLast('•').trim().lowercase()
-        if (fileExtension !in REMUXABLE_CONTAINERS && container !in REMUXABLE_CONTAINERS) return null
-        val normalized = "$details ${filename.orEmpty()}".uppercase()
-        if (INCOMPATIBLE_APPLE_CODECS.any { normalized.contains(it) }) return null
-        val videoScore = when {
-            H264_CODECS.any { normalized.contains(it) } -> 100
-            HEVC_CODECS.any { normalized.contains(it) } -> 80
-            else -> return null
-        }
-        val audioScore = when {
-            normalized.contains("AAC") -> 100
-            normalized.contains("MP3") -> 80
-            DOLBY_AUDIO_CODECS.any { normalized.contains(it) } -> 60
-            else -> 0
-        }
-        return videoScore + audioScore
-    }
-
     private fun capabilities() = ServerPlayerCapabilities(
         directPlayAll = isIos ||
             PlayerSettingsRepository.uiState.value.androidPlaybackEngine == AndroidPlaybackEngine.Libmpv,
     )
-
-    private val APPLE_NATIVE_CONTAINERS = setOf("mp4", "m4v", "mov")
-    private val REMUXABLE_CONTAINERS = setOf("mkv", "matroska", "avi")
-    private val H264_CODECS = setOf("H264", "H.264", "AVC")
-    private val HEVC_CODECS = setOf("HEVC", "H265", "H.265")
-    private val DOLBY_AUDIO_CODECS = setOf("AC3", "EAC3", "DOLBY", " DD ")
-    private val INCOMPATIBLE_APPLE_CODECS = setOf("AV1", "VP8", "VP9")
-    private const val NATIVE_CONTAINER_BONUS = 1_000
 
     private class ActivePlayback(
         val provider: ServerProvider,
