@@ -191,8 +191,7 @@ actual fun PlatformPlayerSurface(
                             )
                         }.getOrDefault(false)
                         if (started) {
-                            bridge.pause()
-                            InAppLogger.info("Player/AirPlay", "handoff started positionMs=${bridge.getPositionMs()}")
+                            InAppLogger.info("Player/AirPlay", "route selection started positionMs=${bridge.getPositionMs()}")
                         } else {
                             InAppLogger.error("Player/AirPlay", "handoff unavailable")
                         }

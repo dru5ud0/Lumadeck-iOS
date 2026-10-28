@@ -8,7 +8,7 @@ import ComposeApp
 
 // MARK: - Player Bridge Implementation (Kotlin protocol conformance)
 
-final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
+final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewDelegate {
 
     private var playerVC: MPVPlayerViewController?
     private var experimentalSinglePrimaryPictureInPictureEnabled = false
@@ -21,7 +21,12 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     private var airPlaySourceURL: String?
     private var airPlaySourceHeaders: [String: String] = [:]
     private var airPlayStartPositionMs: Int64 = 0
+    private var airPlayTitle: String?
     private var didAttemptAirPlayRelay = false
+    private var airPlayRoutePickerView: AVRoutePickerView?
+    private var airPlayRouteChangeObserver: NSObjectProtocol?
+    private var airPlayRouteSelectionWorkItem: DispatchWorkItem?
+    private var airPlayRoutePickerDidEnd = false
 
     func createPlayerViewController() -> UIViewController {
         return ensurePlayerViewController()
@@ -91,39 +96,166 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
         startPositionMs: Int64
     ) -> Bool {
         guard let url = URL(string: videoUrl), url.scheme != nil else { return false }
-        guard airPlayPlayerViewController == nil else { return true }
-        let headers = parseRequestHeaders(headersJson)
-        let controller = AirPlayPlayerViewController()
-        controller.showsPlaybackControls = true
-        controller.modalPresentationStyle = .fullScreen
-        if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            controller.title = title
-        }
-        controller.onDismiss = { [weak self] in
-            self?.airPlayPlayer?.pause()
-            self?.airPlayRelay?.stop()
-            self?.airPlayRelay = nil
-            self?.airPlayPlayer = nil
-            self?.airPlayPlayerViewController = nil
-            self?.airPlayStatusObservation = nil
-            self?.airPlaySourceURL = nil
-            self?.airPlaySourceHeaders = [:]
-            self?.airPlayStartPositionMs = 0
-            self?.didAttemptAirPlayRelay = false
-        }
-
+        guard airPlayPlayerViewController == nil, airPlayRoutePickerView == nil else { return true }
         guard let presenter = playerVC ?? topViewController() else { return false }
 
-        airPlayPlayerViewController = controller
+        let headers = parseRequestHeaders(headersJson)
         airPlaySourceURL = videoUrl
         airPlaySourceHeaders = headers
         airPlayStartPositionMs = startPositionMs
+        airPlayTitle = title
         didAttemptAirPlayRelay = false
 
+        if isAirPlayRouteSelected {
+            beginAirPlayPlayback(url: url, headers: headers, presenter: presenter)
+            return true
+        }
+
+        let picker = AVRoutePickerView(frame: .zero)
+        picker.delegate = self
+        picker.prioritizesVideoDevices = true
+        picker.translatesAutoresizingMaskIntoConstraints = false
+        picker.alpha = 0.01
+        presenter.view.addSubview(picker)
+        NSLayoutConstraint.activate([
+            picker.centerXAnchor.constraint(equalTo: presenter.view.centerXAnchor),
+            picker.centerYAnchor.constraint(equalTo: presenter.view.centerYAnchor),
+            picker.widthAnchor.constraint(equalToConstant: 44),
+            picker.heightAnchor.constraint(equalToConstant: 44),
+        ])
+        airPlayRoutePickerView = picker
+        airPlayRoutePickerDidEnd = false
+        airPlayRouteChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.airPlayRoutePickerDidEnd else { return }
+            self.completeAirPlayRouteSelectionIfPossible()
+        }
+
+        DispatchQueue.main.async { [weak self, weak picker] in
+            guard let self, let picker, self.airPlayRoutePickerView === picker else { return }
+            guard let button = self.firstButton(in: picker) else {
+                self.clearAirPlayRouteSelection(resetSource: true)
+                self.presentAirPlayError("The AirPlay device picker could not be opened.")
+                return
+            }
+            button.sendActions(for: .touchUpInside)
+        }
+        return true
+    }
+
+    func routePickerViewWillBeginPresentingRoutes(_ routePickerView: AVRoutePickerView) {
+        airPlayRoutePickerDidEnd = false
+        airPlayRouteSelectionWorkItem?.cancel()
+        airPlayRouteSelectionWorkItem = nil
+        InAppLogBridge.shared.info(tag: "Player/AirPlay", message: "AirPlay route selection opened")
+    }
+
+    func routePickerViewDidEndPresentingRoutes(_ routePickerView: AVRoutePickerView) {
+        guard airPlayRoutePickerView === routePickerView else { return }
+        airPlayRoutePickerDidEnd = true
+        if completeAirPlayRouteSelectionIfPossible() { return }
+
+        let workItem = DispatchWorkItem { [weak self, weak routePickerView] in
+            guard let self, let routePickerView, self.airPlayRoutePickerView === routePickerView else { return }
+            if !self.completeAirPlayRouteSelectionIfPossible() {
+                InAppLogBridge.shared.info(tag: "Player/AirPlay", message: "AirPlay route selection cancelled")
+                self.clearAirPlayRouteSelection(resetSource: true)
+            }
+        }
+        airPlayRouteSelectionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+    }
+
+    @discardableResult
+    private func completeAirPlayRouteSelectionIfPossible() -> Bool {
+        guard airPlayRoutePickerDidEnd, isAirPlayRouteSelected else { return false }
+        guard
+            let source = airPlaySourceURL,
+            let url = URL(string: source),
+            let presenter = playerVC ?? topViewController()
+        else {
+            clearAirPlayRouteSelection(resetSource: true)
+            return false
+        }
+
+        let headers = airPlaySourceHeaders
+        clearAirPlayRouteSelection(resetSource: false)
+        beginAirPlayPlayback(url: url, headers: headers, presenter: presenter)
+        return true
+    }
+
+    private var isAirPlayRouteSelected: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
+    }
+
+    private func beginAirPlayPlayback(
+        url: URL,
+        headers: [String: String],
+        presenter: UIViewController
+    ) {
+        guard airPlayPlayerViewController == nil else { return }
+
+        playerVC?.refreshPlaybackState()
+        if let positionMs = playerVC?.positionMs {
+            airPlayStartPositionMs = max(0, positionMs)
+        }
+        playerVC?.pausePlayback()
+
+        let controller = AirPlayPlayerViewController()
+        controller.showsPlaybackControls = true
+        controller.modalPresentationStyle = .fullScreen
+        if let title = airPlayTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            controller.title = title
+        }
+        controller.onDismiss = { [weak self] in
+            self?.resetAirPlayPlayback()
+        }
+
+        airPlayPlayerViewController = controller
         presenter.present(controller, animated: true) {
             self.startNativeAirPlayPlayer(url: url, headers: headers, controller: controller)
         }
-        return true
+    }
+
+    private func clearAirPlayRouteSelection(resetSource: Bool) {
+        airPlayRouteSelectionWorkItem?.cancel()
+        airPlayRouteSelectionWorkItem = nil
+        if let observer = airPlayRouteChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            airPlayRouteChangeObserver = nil
+        }
+        airPlayRoutePickerView?.delegate = nil
+        airPlayRoutePickerView?.removeFromSuperview()
+        airPlayRoutePickerView = nil
+        airPlayRoutePickerDidEnd = false
+        if resetSource {
+            airPlaySourceURL = nil
+            airPlaySourceHeaders = [:]
+            airPlayStartPositionMs = 0
+            airPlayTitle = nil
+            didAttemptAirPlayRelay = false
+        }
+    }
+
+    private func resetAirPlayPlayback() {
+        clearAirPlayRouteSelection(resetSource: true)
+        airPlayPlayer?.pause()
+        airPlayRelay?.stop()
+        airPlayRelay = nil
+        airPlayPlayer = nil
+        airPlayPlayerViewController = nil
+        airPlayStatusObservation = nil
+    }
+
+    private func firstButton(in view: UIView) -> UIButton? {
+        if let button = view as? UIButton { return button }
+        for subview in view.subviews {
+            if let button = firstButton(in: subview) { return button }
+        }
+        return nil
     }
 
     private func startNativeAirPlayPlayer(
@@ -427,6 +559,8 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     func getProperty(name: String) -> String { playerVC?.getString(name) ?? "" }
 
     func destroy() {
+        airPlayPlayerViewController?.dismiss(animated: false)
+        resetAirPlayPlayback()
         playerVC?.systemControlHandler = nil
         playerVC?.destroyPlayer()
         playerVC = nil
