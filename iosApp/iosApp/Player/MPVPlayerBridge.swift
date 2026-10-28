@@ -17,6 +17,11 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
     private var airPlayPlayerViewController: AirPlayPlayerViewController?
     private var airPlayPlayer: AVPlayer?
     private var airPlayStatusObservation: NSKeyValueObservation?
+    private var airPlayRelay: AirPlayHLSRelay?
+    private var airPlaySourceURL: String?
+    private var airPlaySourceHeaders: [String: String] = [:]
+    private var airPlayStartPositionMs: Int64 = 0
+    private var didAttemptAirPlayRelay = false
 
     func createPlayerViewController() -> UIViewController {
         return ensurePlayerViewController()
@@ -88,17 +93,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
         guard let url = URL(string: videoUrl), url.scheme != nil else { return false }
         guard airPlayPlayerViewController == nil else { return true }
         let headers = parseRequestHeaders(headersJson)
-        let asset = AVURLAsset(
-            url: url,
-            options: ["AVURLAssetHTTPHeaderFieldsKey": headers]
-        )
-        let item = AVPlayerItem(asset: asset)
-        let player = AVPlayer(playerItem: item)
-        player.allowsExternalPlayback = true
-        player.usesExternalPlaybackWhileExternalScreenIsActive = true
-
         let controller = AirPlayPlayerViewController()
-        controller.player = player
         controller.showsPlaybackControls = true
         controller.modalPresentationStyle = .fullScreen
         if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -106,31 +101,119 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge {
         }
         controller.onDismiss = { [weak self] in
             self?.airPlayPlayer?.pause()
+            self?.airPlayRelay?.stop()
+            self?.airPlayRelay = nil
             self?.airPlayPlayer = nil
             self?.airPlayPlayerViewController = nil
             self?.airPlayStatusObservation = nil
+            self?.airPlaySourceURL = nil
+            self?.airPlaySourceHeaders = [:]
+            self?.airPlayStartPositionMs = 0
+            self?.didAttemptAirPlayRelay = false
         }
 
         guard let presenter = playerVC ?? topViewController() else { return false }
 
         airPlayPlayerViewController = controller
+        airPlaySourceURL = videoUrl
+        airPlaySourceHeaders = headers
+        airPlayStartPositionMs = startPositionMs
+        didAttemptAirPlayRelay = false
+
+        presenter.present(controller, animated: true) {
+            self.startNativeAirPlayPlayer(url: url, headers: headers, controller: controller)
+        }
+        return true
+    }
+
+    private func startNativeAirPlayPlayer(
+        url: URL,
+        headers: [String: String],
+        controller: AirPlayPlayerViewController
+    ) {
+        let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        installAirPlayPlayer(item: AVPlayerItem(asset: asset), controller: controller, allowRelayFallback: true)
+    }
+
+    private func installAirPlayPlayer(
+        item: AVPlayerItem,
+        controller: AirPlayPlayerViewController,
+        allowRelayFallback: Bool
+    ) {
+        airPlayStatusObservation = nil
+        airPlayPlayer?.pause()
+        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        controller.player = player
         airPlayPlayer = player
         airPlayStatusObservation = item.observe(\.status, options: [.new]) { [weak self, weak controller] item, _ in
             guard item.status == .failed else { return }
             let message = self?.airPlayErrorMessage(item)
             DispatchQueue.main.async {
-                controller?.dismiss(animated: true)
-                self?.presentAirPlayError(message)
+                guard let self, let controller else { return }
+                if allowRelayFallback, !self.didAttemptAirPlayRelay {
+                    self.startAirPlayRelay(controller: controller, nativeError: message)
+                } else {
+                    controller.dismiss(animated: true)
+                    self.presentAirPlayError(message)
+                }
             }
         }
+        if airPlayStartPositionMs > 0 {
+            player.seek(to: CMTime(value: airPlayStartPositionMs, timescale: 1000))
+        }
+        player.play()
+    }
 
-        presenter.present(controller, animated: true) {
-            if startPositionMs > 0 {
-                player.seek(to: CMTime(value: startPositionMs, timescale: 1000))
+    private func startAirPlayRelay(controller: AirPlayPlayerViewController, nativeError: String?) {
+        guard !didAttemptAirPlayRelay, let sourceURL = airPlaySourceURL else { return }
+        didAttemptAirPlayRelay = true
+        airPlayStatusObservation = nil
+        airPlayPlayer?.pause()
+        airPlayPlayer = nil
+        controller.player = nil
+        controller.setPreparingRelay(true)
+        do {
+            let relay = try AirPlayHLSRelay(
+                sourceURL: sourceURL,
+                headers: airPlaySourceHeaders,
+                startPositionMs: airPlayStartPositionMs
+            )
+            airPlayRelay = relay
+            relay.onFailure = { [weak self, weak controller, weak relay] error in
+                guard let self, let controller, self.airPlayRelay === relay else { return }
+                controller.dismiss(animated: true)
+                self.presentAirPlayError((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
-            player.play()
+            InAppLogBridge.shared.info(
+                tag: "Player/AirPlay",
+                message: "Native playback failed; starting local HLS remux. \(nativeError ?? "")"
+            )
+            relay.start { [weak self, weak controller, weak relay] result in
+                guard let self, let controller, self.airPlayRelay === relay else { return }
+                controller.setPreparingRelay(false)
+                switch result {
+                case .success(let playlistURL):
+                    InAppLogBridge.shared.info(
+                        tag: "Player/AirPlay",
+                        message: "Local HLS relay ready at \(playlistURL.host ?? "phone")"
+                    )
+                    self.airPlayStartPositionMs = 0
+                    let item = AVPlayerItem(url: playlistURL)
+                    self.installAirPlayPlayer(item: item, controller: controller, allowRelayFallback: false)
+                case .failure(let error):
+                    controller.dismiss(animated: true)
+                    let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.presentAirPlayError([nativeError, relayMessage].compactMap { $0 }.joined(separator: "\n\n"))
+                }
+            }
+        } catch {
+            controller.setPreparingRelay(false)
+            controller.dismiss(animated: true)
+            let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            presentAirPlayError([nativeError, relayMessage].compactMap { $0 }.joined(separator: "\n\n"))
         }
-        return true
     }
 
     private func airPlayErrorMessage(_ item: AVPlayerItem) -> String? {
@@ -2691,6 +2774,28 @@ enum NuvioPlayerRegistration {
 
 private final class AirPlayPlayerViewController: AVPlayerViewController {
     var onDismiss: (() -> Void)?
+    private lazy var preparingIndicator: UIActivityIndicatorView = {
+        let indicator = UIActivityIndicatorView(style: .large)
+        indicator.color = .white
+        indicator.translatesAutoresizingMaskIntoConstraints = false
+        return indicator
+    }()
+
+    func setPreparingRelay(_ preparing: Bool) {
+        if preparing {
+            if preparingIndicator.superview == nil, let overlay = contentOverlayView {
+                overlay.addSubview(preparingIndicator)
+                NSLayoutConstraint.activate([
+                    preparingIndicator.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+                    preparingIndicator.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+                ])
+            }
+            preparingIndicator.startAnimating()
+        } else {
+            preparingIndicator.stopAnimating()
+            preparingIndicator.removeFromSuperview()
+        }
+    }
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
