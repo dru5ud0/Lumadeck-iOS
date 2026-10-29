@@ -33,6 +33,11 @@ AGENTS.md
 PERFORMANCE_FINDINGS.md
 scripts/*
 !scripts/sign-ios-device-app.py
+!scripts/lumadeck_ios_lab.py
+!scripts/lumadeck_airplay_origin.py
+!scripts/tests/
+!scripts/tests/test_lumadeck_ios_lab.py
+!scripts/tests/test_lumadeck_airplay_origin.py
 iosApp/Configuration/DeviceSigning.local.json
 
 # Local MPVKit iOS build environment (sparse APFS image, see MPVKit docs)

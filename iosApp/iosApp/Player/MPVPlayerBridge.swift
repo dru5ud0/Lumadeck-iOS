@@ -3120,7 +3120,7 @@ enum NuvioPlayerRegistration {
     }
 }
 
-private final class AirPlayPlayerViewController: UIViewController {
+final class AirPlayPlayerViewController: UIViewController {
     var onDismiss: (() -> Void)?
     var onExternalPlaybackEnded: ((Int64, Bool) -> Void)?
     var player: AVPlayer?
@@ -3175,6 +3175,23 @@ private final class AirPlayPlayerViewController: UIViewController {
     private var playbackEndedObserver: NSObjectProtocol?
     private var audioMenuElements: [UIMenuElement] = []
     private var speedMenuElements: [UIMenuElement] = []
+#if DEBUG
+    private var mockState: AirPlayMockState?
+    private lazy var mockRouteIcon: UIImageView = {
+        let view = UIImageView(image: UIImage(systemName: "airplayvideo"))
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.tintColor = .white
+        view.contentMode = .scaleAspectFit
+        return view
+    }()
+    private lazy var mockPreparingIcon: UIImageView = {
+        let view = UIImageView(image: UIImage(systemName: "hourglass"))
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.tintColor = .white
+        view.contentMode = .scaleAspectFit
+        return view
+    }()
+#endif
 
     private lazy var remoteContainer: UIView = {
         let view = UIView()
@@ -3284,6 +3301,33 @@ private final class AirPlayPlayerViewController: UIViewController {
         showUnavailableMediaMenus()
         refreshInterface()
     }
+
+#if DEBUG
+    func applyMockState(_ state: AirPlayMockState) {
+        mockState = state
+        loadViewIfNeeded()
+        displayTitle = state == .longTitle
+            ? "A Deliberately Long AirPlay Test Title for Layout Verification"
+            : "Lumadeck AirPlay Test"
+        knownDurationSeconds = state == .live ? 0 : 7_200
+        lastKnownPositionSeconds = 1_845
+        playbackIntended = state == .playing || state == .compatibility || state == .live || state == .longTitle
+        playbackEnded = state == .ended
+        isPreparingRelay = state == .preparingRelay
+        routePicker.alpha = 0
+        routePicker.isUserInteractionEnabled = false
+        if mockRouteIcon.superview == nil {
+            remoteContainer.addSubview(mockRouteIcon)
+            NSLayoutConstraint.activate([
+                mockRouteIcon.centerXAnchor.constraint(equalTo: routePicker.centerXAnchor),
+                mockRouteIcon.centerYAnchor.constraint(equalTo: routePicker.centerYAnchor),
+                mockRouteIcon.widthAnchor.constraint(equalToConstant: 24),
+                mockRouteIcon.heightAnchor.constraint(equalToConstant: 24),
+            ])
+        }
+        renderMockState()
+    }
+#endif
 
     func configure(
         displayTitle: String?,
@@ -3477,6 +3521,17 @@ private final class AirPlayPlayerViewController: UIViewController {
         controls.spacing = 8
 
         let stack = UIStackView(arrangedSubviews: [header, timeline, controls])
+        remoteContainer.accessibilityIdentifier = "airplay.remote.container"
+        statusLabel.accessibilityIdentifier = "airplay.remote.status"
+        titleLabel.accessibilityIdentifier = "airplay.remote.title"
+        timelineSlider.accessibilityIdentifier = "airplay.remote.timeline"
+        rewindButton.accessibilityIdentifier = "airplay.remote.rewind"
+        playPauseButton.accessibilityIdentifier = "airplay.remote.playPause"
+        forwardButton.accessibilityIdentifier = "airplay.remote.forward"
+        subtitlesButton.accessibilityIdentifier = "airplay.remote.subtitles"
+        speedButton.accessibilityIdentifier = "airplay.remote.options"
+        routePicker.accessibilityIdentifier = "airplay.remote.routePicker"
+        stopButton.accessibilityIdentifier = "airplay.remote.stop"
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
         stack.alignment = .fill
@@ -3666,6 +3721,12 @@ private final class AirPlayPlayerViewController: UIViewController {
 
     private func refreshInterface() {
         guard isViewLoaded else { return }
+#if DEBUG
+        if mockState != nil {
+            renderMockState()
+            return
+        }
+#endif
         titleLabel.text = displayTitle
         guard let player = trackedPlayer else {
             playPauseButton.isEnabled = false
@@ -3691,6 +3752,77 @@ private final class AirPlayPlayerViewController: UIViewController {
         }
         updateSystemNowPlaying(player: player)
     }
+
+#if DEBUG
+    private func renderMockState() {
+        guard isViewLoaded, let mockState else { return }
+        titleLabel.text = displayTitle
+        preparingIndicator.stopAnimating()
+        preparingIndicator.removeFromSuperview()
+        let playing = mockState == .playing || mockState == .compatibility || mockState == .live || mockState == .longTitle
+        let symbol = playing ? "pause.fill" : "play.fill"
+        playPauseButton.setImage(
+            UIImage(systemName: symbol)?.withConfiguration(
+                UIImage.SymbolConfiguration(pointSize: 34, weight: .semibold)
+            ),
+            for: .normal
+        )
+        updateTimeline(positionSeconds: lastKnownPositionSeconds)
+        switch mockState {
+        case .connecting:
+            statusLabel.text = "CONNECTING"
+            setRemoteControlsEnabled(false)
+        case .playing, .longTitle:
+            statusLabel.text = "PLAYING ON TV"
+            setRemoteControlsEnabled(true)
+        case .paused:
+            statusLabel.text = "PAUSED ON TV"
+            setRemoteControlsEnabled(true)
+        case .preparingRelay:
+            statusLabel.text = "PREPARING TV STREAM"
+            if mockPreparingIcon.superview == nil {
+                remoteContainer.addSubview(mockPreparingIcon)
+                NSLayoutConstraint.activate([
+                    mockPreparingIcon.centerXAnchor.constraint(equalTo: remoteContainer.centerXAnchor),
+                    mockPreparingIcon.centerYAnchor.constraint(equalTo: remoteContainer.centerYAnchor),
+                    mockPreparingIcon.widthAnchor.constraint(equalToConstant: 32),
+                    mockPreparingIcon.heightAnchor.constraint(equalToConstant: 32),
+                ])
+            }
+            mockPreparingIcon.isHidden = false
+            setRemoteControlsEnabled(false)
+        case .compatibility:
+            statusLabel.text = "TV • COMPATIBILITY MODE"
+            setRemoteControlsEnabled(true)
+            timelineSlider.isEnabled = false
+            rewindButton.isEnabled = false
+            forwardButton.isEnabled = false
+        case .reconnecting:
+            statusLabel.text = "RECONNECTING"
+            setRemoteControlsEnabled(false)
+        case .live:
+            statusLabel.text = "LIVE ON TV"
+            setRemoteControlsEnabled(true)
+            timelineSlider.isEnabled = false
+            rewindButton.isEnabled = false
+            forwardButton.isEnabled = false
+        case .ended:
+            statusLabel.text = "PLAYBACK ENDED"
+            setRemoteControlsEnabled(false)
+        case .failed:
+            statusLabel.text = "PLAYBACK FAILED"
+            statusLabel.textColor = .systemRed
+            setRemoteControlsEnabled(false)
+        }
+        if mockState != .preparingRelay {
+            mockPreparingIcon.isHidden = true
+        }
+        statusLabel.textColor = mockState == .failed ? .systemRed : .systemGreen
+        if mockState == .live {
+            remainingTimeLabel.text = "Live"
+        }
+    }
+#endif
 
     private func updateTimeline(positionSeconds: Double) {
         let duration = resolvedDurationSeconds
