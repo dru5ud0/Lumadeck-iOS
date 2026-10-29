@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -16,6 +17,21 @@ class RecordingLab(LAB.IPhoneLab):
 
     def gesture_session(self, instructions):
         self.instructions = instructions
+
+
+class MockCaptureLab:
+    udid = "test-udid"
+    bundle_id = "com.example.test"
+
+    def __init__(self) -> None:
+        self.launches = []
+
+    def launch(self, arguments):
+        self.launches.append(arguments)
+
+    def screenshot(self, destination):
+        destination.write_bytes(b"png")
+        return destination
 
 
 class IPhoneLabTests(unittest.TestCase):
@@ -42,6 +58,24 @@ class IPhoneLabTests(unittest.TestCase):
     def test_evidence_root_is_under_workspace_loot(self):
         expected = LAB.WORKSPACE_ROOT / "loot" / "logs" / "lumadeck-ios"
         self.assertEqual(expected, LAB.DEFAULT_EVIDENCE_ROOT)
+
+    def test_mock_matrix_launches_each_requested_state(self):
+        lab = MockCaptureLab()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = LAB.capture_mock_matrix(
+                lab,
+                Path(temporary_directory),
+                ["playing", "failed"],
+                0,
+            )
+
+            self.assertEqual(
+                [["--airplay-mock", "playing"], ["--airplay-mock", "failed"]],
+                lab.launches,
+            )
+            self.assertTrue((result / "playing.png").is_file())
+            self.assertTrue((result / "failed.png").is_file())
+            self.assertTrue((result / "manifest.json").is_file())
 
 
 if __name__ == "__main__":

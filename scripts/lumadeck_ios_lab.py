@@ -35,6 +35,18 @@ DEFAULT_PYMOBILEDEVICE3 = Path(
 DEFAULT_UDID = "00008030-001A6418022A802E"
 DEFAULT_BUNDLE_ID = "com.nuvio.app.B63937U9BG"
 DEFAULT_EVIDENCE_ROOT = WORKSPACE_ROOT / "loot" / "logs" / "lumadeck-ios"
+MOCK_STATES = (
+    "connecting",
+    "playing",
+    "paused",
+    "preparing-relay",
+    "compatibility",
+    "reconnecting",
+    "live",
+    "ended",
+    "failed",
+    "long-title",
+)
 
 # iPhone 11 passcode keypad centers in normalized 16-bit display coordinates.
 # Coordinates can be overridden without changing code if display calibration changes.
@@ -221,6 +233,32 @@ def create_evidence_run(lab: IPhoneLab, root: Path, label: str) -> Path:
     return run_directory
 
 
+def capture_mock_matrix(
+    lab: IPhoneLab,
+    root: Path,
+    states: list[str],
+    settle_seconds: float,
+) -> Path:
+    run_directory = root / f"{utc_timestamp()}-airplay-mock-matrix"
+    run_directory.mkdir(parents=True, exist_ok=False)
+    captures = []
+    for state in states:
+        lab.launch(["--airplay-mock", state])
+        time.sleep(settle_seconds)
+        screenshot = lab.screenshot(run_directory / f"{state}.png")
+        captures.append({"state": state, "screenshot": screenshot.name})
+    write_json(
+        run_directory / "manifest.json",
+        {
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "udid": lab.udid,
+            "bundleId": lab.bundle_id,
+            "captures": captures,
+        },
+    )
+    return run_directory
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pymobiledevice3", type=Path, default=DEFAULT_PYMOBILEDEVICE3)
@@ -255,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
     capture = subparsers.add_parser("capture")
     capture.add_argument("--label", default="manual")
     capture.add_argument("--output-root", type=Path, default=DEFAULT_EVIDENCE_ROOT)
+
+    matrix = subparsers.add_parser("mock-matrix")
+    matrix.add_argument("--state", action="append", choices=MOCK_STATES, dest="states")
+    matrix.add_argument("--settle-seconds", type=float, default=1.5)
+    matrix.add_argument("--output-root", type=Path, default=DEFAULT_EVIDENCE_ROOT)
     return parser
 
 
@@ -288,6 +331,9 @@ def main() -> int:
             print("Unlock gesture sent.")
         elif args.command == "capture":
             print(create_evidence_run(lab, args.output_root, args.label).resolve())
+        elif args.command == "mock-matrix":
+            states = args.states or list(MOCK_STATES)
+            print(capture_mock_matrix(lab, args.output_root, states, args.settle_seconds).resolve())
         else:
             raise LabError(f"unsupported command: {args.command}")
     except (LabError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
