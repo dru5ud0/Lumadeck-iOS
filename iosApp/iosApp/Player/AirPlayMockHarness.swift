@@ -1,4 +1,5 @@
 #if DEBUG
+import AVFoundation
 import SwiftUI
 import UIKit
 
@@ -14,6 +15,7 @@ enum AirPlayMockState: String, CaseIterable {
     case failed
     case longTitle = "long-title"
     case routePicker = "route-picker"
+    case playbackProbe = "playback-probe"
 }
 
 enum AirPlayMockHarness {
@@ -32,10 +34,19 @@ enum AirPlayMockHarness {
         controller.modalPresentationStyle = .fullScreen
         controller.configure(
             displayTitle: "Lumadeck AirPlay Test",
-            knownDurationMs: 7_200_000,
-            initialPositionMs: 1_845_000,
-            playWhenReady: state == .playing || state == .compatibility || state == .live || state == .longTitle
+            knownDurationMs: state == .playbackProbe ? 12_000 : 7_200_000,
+            initialPositionMs: state == .playbackProbe ? 0 : 1_845_000,
+            playWhenReady: state == .playing || state == .compatibility || state == .live || state == .longTitle || state == .playbackProbe
         )
+        if state == .playbackProbe, let url = requestedProbeURL {
+            let item = AVPlayerItem(url: url)
+            let player = AVPlayer(playerItem: item)
+            player.allowsExternalPlayback = true
+            player.usesExternalPlaybackWhileExternalScreenIsActive = true
+            controller.attach(player: player, item: item)
+            player.play()
+            return controller
+        }
         controller.applyMockState(state)
         if state == .routePicker {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
@@ -43,6 +54,15 @@ enum AirPlayMockHarness {
             }
         }
         return controller
+    }
+
+    private static var requestedProbeURL: URL? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard
+            let index = arguments.firstIndex(of: "--airplay-probe-url"),
+            arguments.indices.contains(index + 1)
+        else { return nil }
+        return URL(string: arguments[index + 1])
     }
 }
 

@@ -3824,6 +3824,9 @@ final class AirPlayPlayerViewController: UIViewController {
         case .routePicker:
             statusLabel.text = "SELECT AIRPLAY DEVICE"
             setRemoteControlsEnabled(false)
+        case .playbackProbe:
+            statusLabel.text = "STARTING PLAYBACK PROBE"
+            setRemoteControlsEnabled(false)
         }
         if mockState != .preparingRelay {
             mockPreparingIcon.isHidden = true
