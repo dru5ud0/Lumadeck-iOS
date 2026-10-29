@@ -3314,8 +3314,8 @@ final class AirPlayPlayerViewController: UIViewController {
         playbackIntended = state == .playing || state == .compatibility || state == .live || state == .longTitle
         playbackEnded = state == .ended
         isPreparingRelay = state == .preparingRelay
-        routePicker.alpha = 0
-        routePicker.isUserInteractionEnabled = false
+        routePicker.alpha = state == .routePicker ? 1 : 0
+        routePicker.isUserInteractionEnabled = state == .routePicker
         if mockRouteIcon.superview == nil {
             remoteContainer.addSubview(mockRouteIcon)
             NSLayoutConstraint.activate([
@@ -3325,7 +3325,15 @@ final class AirPlayPlayerViewController: UIViewController {
                 mockRouteIcon.heightAnchor.constraint(equalToConstant: 24),
             ])
         }
+        mockRouteIcon.isHidden = state == .routePicker
         renderMockState()
+    }
+
+    func presentRoutePickerForTesting() {
+        loadViewIfNeeded()
+        if let button = routePicker.subviews.compactMap({ $0 as? UIButton }).first {
+            button.sendActions(for: .touchUpInside)
+        }
     }
 #endif
 
@@ -3812,6 +3820,9 @@ final class AirPlayPlayerViewController: UIViewController {
         case .failed:
             statusLabel.text = "PLAYBACK FAILED"
             statusLabel.textColor = .systemRed
+            setRemoteControlsEnabled(false)
+        case .routePicker:
+            statusLabel.text = "SELECT AIRPLAY DEVICE"
             setRemoteControlsEnabled(false)
         }
         if mockState != .preparingRelay {

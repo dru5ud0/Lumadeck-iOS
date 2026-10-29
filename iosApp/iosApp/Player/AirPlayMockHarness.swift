@@ -13,6 +13,7 @@ enum AirPlayMockState: String, CaseIterable {
     case ended
     case failed
     case longTitle = "long-title"
+    case routePicker = "route-picker"
 }
 
 enum AirPlayMockHarness {
@@ -36,6 +37,11 @@ enum AirPlayMockHarness {
             playWhenReady: state == .playing || state == .compatibility || state == .live || state == .longTitle
         )
         controller.applyMockState(state)
+        if state == .routePicker {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+                controller.presentRoutePickerForTesting()
+            }
+        }
         return controller
     }
 }

@@ -133,8 +133,16 @@ class IPhoneLab:
 
     def launch(self, arguments: list[str] | None = None) -> None:
         command = ["developer", "core-device", "launch-application", self.bundle_id]
-        command.extend(arguments or [])
-        self.run(command)
+        if arguments:
+            command.extend(["--", *arguments])
+        for attempt in range(3):
+            result = self.run(command, check=False)
+            if result.returncode == 0:
+                return
+            if attempt < 2:
+                time.sleep(1)
+        detail = (result.stderr or result.stdout).strip()
+        raise LabError(f"pymobiledevice3 failed ({result.returncode}): {detail}")
 
     def button(self, name: str) -> None:
         self.run(["developer", "core-device", "hid", "button", name, "press"])
