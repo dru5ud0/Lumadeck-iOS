@@ -91,17 +91,15 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         }
     }
     func seekTo(positionMs: Int64) {
-        if let airPlayPlayer, !didAttemptAirPlayRelay {
-            airPlayPlayer.seek(to: CMTime(value: max(0, positionMs), timescale: 1000))
+        if airPlayPlayer != nil, !didAttemptAirPlayRelay {
+            airPlayPlayerViewController?.seekToMsPreservingPlayback(positionMs)
         } else if airPlayPlayer == nil {
             playerVC?.seekToMs(positionMs)
         }
     }
     func seekBy(offsetMs: Int64) {
-        if let airPlayPlayer, !didAttemptAirPlayRelay {
-            let seconds = airPlayPlayer.currentTime().seconds
-            let currentMs = seconds.isFinite ? Int64(max(0, seconds) * 1000) : 0
-            airPlayPlayer.seek(to: CMTime(value: max(0, currentMs + offsetMs), timescale: 1000))
+        if airPlayPlayer != nil, !didAttemptAirPlayRelay {
+            airPlayPlayerViewController?.seekByMsPreservingPlayback(offsetMs)
         } else if airPlayPlayer == nil {
             playerVC?.seekByMs(offsetMs)
         }
@@ -246,15 +244,13 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
                 controller?.setPlaybackIntended(playing)
                 if playing { player.play() } else { player.pause() }
             },
-            seekTo: { [weak self] positionMs in
+            seekTo: { [weak self, weak controller] positionMs in
                 guard let self, !self.didAttemptAirPlayRelay else { return }
-                self.airPlayPlayer?.seek(to: CMTime(value: max(0, positionMs), timescale: 1000))
+                controller?.seekToMsPreservingPlayback(positionMs)
             },
-            seekBy: { [weak self] offsetMs in
-                guard let self, !self.didAttemptAirPlayRelay, let player = self.airPlayPlayer else { return }
-                let seconds = player.currentTime().seconds
-                let currentMs = seconds.isFinite ? Int64(max(0, seconds) * 1000) : 0
-                player.seek(to: CMTime(value: max(0, currentMs + offsetMs), timescale: 1000))
+            seekBy: { [weak self, weak controller] offsetMs in
+                guard let self, !self.didAttemptAirPlayRelay else { return }
+                controller?.seekByMsPreservingPlayback(offsetMs)
             }
         )
 
@@ -3120,7 +3116,7 @@ enum NuvioPlayerRegistration {
     }
 }
 
-final class AirPlayPlayerViewController: UIViewController {
+final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDelegate {
     var onDismiss: (() -> Void)?
     var onExternalPlaybackEnded: ((Int64, Bool) -> Void)?
     var player: AVPlayer?
@@ -3179,6 +3175,7 @@ final class AirPlayPlayerViewController: UIViewController {
     private var speedMenuElements: [UIMenuElement] = []
 #if DEBUG
     private var mockState: AirPlayMockState?
+    private var playbackProbeURL: URL?
     private lazy var mockRouteIcon: UIImageView = {
         let view = UIImageView(image: UIImage(systemName: "airplayvideo"))
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -3299,12 +3296,47 @@ final class AirPlayPlayerViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .black
         installRemoteInterface()
+        routePicker.delegate = self
         refreshSpeedMenu()
         showUnavailableMediaMenus()
         refreshInterface()
     }
 
 #if DEBUG
+    func configurePlaybackProbe(url: URL) {
+        playbackProbeURL = url
+        loadViewIfNeeded()
+        statusLabel.text = "SELECT AIRPLAY DEVICE"
+        setRemoteControlsEnabled(false)
+    }
+
+    private func startPlaybackProbe() {
+        guard let url = playbackProbeURL else { return }
+        playbackProbeURL = nil
+        let item = AVPlayerItem(url: url)
+        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        attach(player: player, item: item)
+        setPlaybackIntended(true)
+        player.playImmediately(atRate: playbackSpeed)
+    }
+
+    private func startPlaybackProbeWhenRouteReady(attemptsRemaining: Int = 20) {
+        guard playbackProbeURL != nil else { return }
+        let routeUsesAirPlay = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+            $0.portType == .airPlay
+        }
+        guard routeUsesAirPlay else {
+            guard attemptsRemaining > 0 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.startPlaybackProbeWhenRouteReady(attemptsRemaining: attemptsRemaining - 1)
+            }
+            return
+        }
+        startPlaybackProbe()
+    }
+
     func applyMockState(_ state: AirPlayMockState) {
         mockState = state
         loadViewIfNeeded()
@@ -3338,6 +3370,15 @@ final class AirPlayPlayerViewController: UIViewController {
         }
     }
 #endif
+
+    func routePickerViewDidEndPresentingRoutes(_ routePickerView: AVRoutePickerView) {
+#if DEBUG
+        guard playbackProbeURL != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.startPlaybackProbeWhenRouteReady()
+        }
+#endif
+    }
 
     func configure(
         displayTitle: String?,
@@ -3909,14 +3950,23 @@ final class AirPlayPlayerViewController: UIViewController {
         refreshInterface()
     }
 
-    @objc private func rewindTapped() { seekBy(seconds: -15) }
-    @objc private func forwardTapped() { seekBy(seconds: 30) }
+    @objc private func rewindTapped() { seekByMsPreservingPlayback(-15_000) }
+    @objc private func forwardTapped() { seekByMsPreservingPlayback(30_000) }
 
-    private func seekBy(seconds: Double) {
+    func seekByMsPreservingPlayback(_ offsetMs: Int64) {
+        guard let player = trackedPlayer, timelineOffsetSeconds == 0 else { return }
+        let current = resolvedPositionSeconds(player: player)
+        seekToSecondsPreservingPlayback(current + Double(offsetMs) / 1000)
+    }
+
+    func seekToMsPreservingPlayback(_ positionMs: Int64) {
+        seekToSecondsPreservingPlayback(Double(max(0, positionMs)) / 1000)
+    }
+
+    private func seekToSecondsPreservingPlayback(_ requestedTarget: Double) {
         guard let player = trackedPlayer, timelineOffsetSeconds == 0 else { return }
         let duration = resolvedDurationSeconds
-        let current = resolvedPositionSeconds(player: player)
-        let target = min(max(0, current + seconds), duration > 0 ? duration : current + max(seconds, 0))
+        let target = min(max(0, requestedTarget), duration > 0 ? duration : max(0, requestedTarget))
         let shouldResume = playbackIntended
         seekGeneration &+= 1
         let expectedPlaybackIntentGeneration = playbackIntentGeneration
@@ -3951,30 +4001,9 @@ final class AirPlayPlayerViewController: UIViewController {
 
     @objc private func scrubbingEnded() {
         guard let player = trackedPlayer else { return }
-        let shouldResume = playbackIntended
-        seekGeneration &+= 1
-        let expectedPlaybackIntentGeneration = playbackIntentGeneration
-        let expectedSeekGeneration = seekGeneration
         isScrubbing = false
-        let target = Double(timelineSlider.value)
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 1000)) { [weak self, weak player] finished in
-            DispatchQueue.main.async {
-                guard
-                    finished,
-                    shouldResume,
-                    let self,
-                    let player,
-                    self.trackedPlayer === player,
-                    self.playbackIntentGeneration == expectedPlaybackIntentGeneration,
-                    self.seekGeneration == expectedSeekGeneration,
-                    !self.isEndingSession,
-                    !self.playbackEnded
-                else { return }
-                self.setPlaybackIntended(true)
-                player.playImmediately(atRate: self.playbackSpeed)
-            }
-        }
-        updateTimeline(positionSeconds: target)
+        guard trackedPlayer === player else { return }
+        seekToSecondsPreservingPlayback(Double(timelineSlider.value))
     }
 
     @objc private func stopTapped() {

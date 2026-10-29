@@ -39,12 +39,10 @@ enum AirPlayMockHarness {
             playWhenReady: state == .playing || state == .compatibility || state == .live || state == .longTitle || state == .playbackProbe
         )
         if state == .playbackProbe, let url = requestedProbeURL {
-            let item = AVPlayerItem(url: url)
-            let player = AVPlayer(playerItem: item)
-            player.allowsExternalPlayback = true
-            player.usesExternalPlaybackWhileExternalScreenIsActive = true
-            controller.attach(player: player, item: item)
-            player.play()
+            controller.configurePlaybackProbe(url: url)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+                controller.presentRoutePickerForTesting()
+            }
             return controller
         }
         controller.applyMockState(state)
