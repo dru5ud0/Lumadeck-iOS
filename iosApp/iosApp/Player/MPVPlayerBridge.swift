@@ -3130,6 +3130,8 @@ final class AirPlayPlayerViewController: UIViewController {
     private var isScrubbing = false
     private var playbackSpeed: Float = 1
     private var playbackIntended = true
+    private var playbackIntentGeneration: UInt = 0
+    private var seekGeneration: UInt = 0
     private var lastKnownPositionSeconds: Double = 0
     var playbackIsIntended: Bool { playbackIntended }
     var remoteIsLoading: Bool {
@@ -3750,7 +3752,7 @@ final class AirPlayPlayerViewController: UIViewController {
         )
         if !isPreparingRelay {
             if player.isExternalPlaybackActive {
-                statusLabel.text = "PLAYING ON TV"
+                statusLabel.text = playbackIntended ? "PLAYING ON TV" : "PAUSED ON TV"
             } else {
                 statusLabel.text = didBecomeExternallyActive ? "RECONNECTING" : "CONNECTING"
             }
@@ -3915,7 +3917,27 @@ final class AirPlayPlayerViewController: UIViewController {
         let duration = resolvedDurationSeconds
         let current = resolvedPositionSeconds(player: player)
         let target = min(max(0, current + seconds), duration > 0 ? duration : current + max(seconds, 0))
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 1000))
+        let shouldResume = playbackIntended
+        seekGeneration &+= 1
+        let expectedPlaybackIntentGeneration = playbackIntentGeneration
+        let expectedSeekGeneration = seekGeneration
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 1000)) { [weak self, weak player] finished in
+            DispatchQueue.main.async {
+                guard
+                    finished,
+                    shouldResume,
+                    let self,
+                    let player,
+                    self.trackedPlayer === player,
+                    self.playbackIntentGeneration == expectedPlaybackIntentGeneration,
+                    self.seekGeneration == expectedSeekGeneration,
+                    !self.isEndingSession,
+                    !self.playbackEnded
+                else { return }
+                self.setPlaybackIntended(true)
+                player.playImmediately(atRate: self.playbackSpeed)
+            }
+        }
         updateTimeline(positionSeconds: target)
     }
 
@@ -3929,15 +3951,35 @@ final class AirPlayPlayerViewController: UIViewController {
 
     @objc private func scrubbingEnded() {
         guard let player = trackedPlayer else { return }
+        let shouldResume = playbackIntended
+        seekGeneration &+= 1
+        let expectedPlaybackIntentGeneration = playbackIntentGeneration
+        let expectedSeekGeneration = seekGeneration
         isScrubbing = false
         let target = Double(timelineSlider.value)
-        player.seek(to: CMTime(seconds: target, preferredTimescale: 1000))
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 1000)) { [weak self, weak player] finished in
+            DispatchQueue.main.async {
+                guard
+                    finished,
+                    shouldResume,
+                    let self,
+                    let player,
+                    self.trackedPlayer === player,
+                    self.playbackIntentGeneration == expectedPlaybackIntentGeneration,
+                    self.seekGeneration == expectedSeekGeneration,
+                    !self.isEndingSession,
+                    !self.playbackEnded
+                else { return }
+                self.setPlaybackIntended(true)
+                player.playImmediately(atRate: self.playbackSpeed)
+            }
+        }
         updateTimeline(positionSeconds: target)
     }
 
     @objc private func stopTapped() {
         isEndingSession = true
-        playbackIntended = false
+        setPlaybackIntended(false)
         trackedPlayer?.pause()
         if let onExternalPlaybackEnded {
             onExternalPlaybackEnded(remotePositionMs, false)
@@ -3947,6 +3989,7 @@ final class AirPlayPlayerViewController: UIViewController {
     }
 
     func setPlaybackIntended(_ playing: Bool) {
+        playbackIntentGeneration &+= 1
         if playing {
             didStartPlayback = true
             if playbackEnded {
