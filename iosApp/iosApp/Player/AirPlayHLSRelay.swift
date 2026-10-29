@@ -66,6 +66,7 @@ final class AirPlayHLSRelay {
     private let rootURL: URL
     private let stateQueue = DispatchQueue(label: "airplay-hls-relay.state")
     private let networkQueue = DispatchQueue(label: "airplay-hls-relay.network")
+    private let fileQueue = DispatchQueue(label: "airplay-hls-relay.files", qos: .userInitiated, attributes: .concurrent)
     private let remuxQueue = DispatchQueue(label: "airplay-hls-relay.remux", qos: .userInitiated)
     private let abortFlag = AirPlayRelayAbortFlag()
 
@@ -123,8 +124,11 @@ final class AirPlayHLSRelay {
             }
         }
         let directory = rootURL
+        let relayFileQueue = fileQueue
         remuxQueue.async {
-            try? FileManager.default.removeItem(at: directory)
+            relayFileQueue.async(flags: .barrier) {
+                try? FileManager.default.removeItem(at: directory)
+            }
         }
     }
 
@@ -250,38 +254,45 @@ final class AirPlayHLSRelay {
             send(status: "404 Not Found", contentType: "text/plain", body: Data(), on: connection)
             return
         }
-        if let number = Int(name.dropFirst("segment-".count).dropLast(".ts".count)) {
-            recordRequestedSegment(number)
-        }
+        let segmentNumber = Int(name.dropFirst("segment-".count).dropLast(".ts".count))
         let fileURL = rootURL.appendingPathComponent(name)
-        guard let data = try? Data(contentsOf: fileURL) else {
-            send(status: "404 Not Found", contentType: "text/plain", body: Data(), on: connection)
-            return
-        }
         let rangeHeader = lines.first { $0.lowercased().hasPrefix("range:") }
-        if method == "GET", let range = byteRange(from: rangeHeader, length: data.count) {
-            let body = data.subdata(in: range)
-            send(
-                status: "206 Partial Content",
+        fileQueue.async { [weak self] in
+            guard let self else {
+                connection.cancel()
+                return
+            }
+            guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
+                self.send(status: "404 Not Found", contentType: "text/plain", body: Data(), on: connection)
+                return
+            }
+            if let segmentNumber {
+                self.recordRequestedSegment(segmentNumber)
+            }
+            if method == "GET", let range = self.byteRange(from: rangeHeader, length: data.count) {
+                let body = data.subdata(in: range)
+                self.send(
+                    status: "206 Partial Content",
+                    contentType: "video/mp2t",
+                    body: body,
+                    extraHeaders: [
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "public, max-age=3600",
+                        "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(data.count)",
+                    ],
+                    on: connection
+                )
+                return
+            }
+            self.send(
+                status: "200 OK",
                 contentType: "video/mp2t",
-                body: body,
-                extraHeaders: [
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "public, max-age=3600",
-                    "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(data.count)",
-                ],
+                body: data,
+                sendBody: method != "HEAD",
+                extraHeaders: ["Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600"],
                 on: connection
             )
-            return
         }
-        send(
-            status: "200 OK",
-            contentType: "video/mp2t",
-            body: data,
-            sendBody: method != "HEAD",
-            extraHeaders: ["Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600"],
-            on: connection
-        )
     }
 
     private func byteRange(from header: String?, length: Int) -> Range<Int>? {
@@ -302,8 +313,11 @@ final class AirPlayHLSRelay {
             let oldestToKeep = max(0, self.highestRequestedSegment - Self.maximumSegmentsBehind)
             let expired = self.segments.filter { $0.number < oldestToKeep }
             self.segments.removeAll { $0.number < oldestToKeep }
-            for segment in expired {
-                try? FileManager.default.removeItem(at: self.rootURL.appendingPathComponent(segment.filename))
+            let rootURL = self.rootURL
+            self.fileQueue.async(flags: .barrier) {
+                for segment in expired {
+                    try? FileManager.default.removeItem(at: rootURL.appendingPathComponent(segment.filename))
+                }
             }
         }
     }

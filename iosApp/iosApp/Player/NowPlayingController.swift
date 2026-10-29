@@ -198,8 +198,8 @@ final class PlayerNowPlayingController {
         center.skipForwardCommand.isEnabled = true
         center.skipBackwardCommand.isEnabled = true
         center.changePlaybackPositionCommand.isEnabled = true
-        center.skipForwardCommand.preferredIntervals = [10]
-        center.skipBackwardCommand.preferredIntervals = [10]
+        center.skipForwardCommand.preferredIntervals = [30]
+        center.skipBackwardCommand.preferredIntervals = [15]
 
         remoteTargets.append(
             RemoteCommandTarget(
@@ -225,7 +225,7 @@ final class PlayerNowPlayingController {
                 token: center.togglePlayPauseCommand.addTarget { [weak self] _ in
                     DispatchQueue.main.async {
                         guard let owner = self?.owner else { return }
-                        owner.requestSystemPlaying(!owner.isPlayerPlaying)
+                        owner.requestSystemPlaying(!owner.isSystemPlaybackPlaying)
                     }
                     return .success
                 }

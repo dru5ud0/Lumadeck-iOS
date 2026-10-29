@@ -30,6 +30,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
     private var airPlayRouteChangeObserver: NSObjectProtocol?
     private var airPlayRouteSelectionWorkItem: DispatchWorkItem?
     private var airPlayRoutePickerDidEnd = false
+    private var airPlayBackgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     func createPlayerViewController() -> UIViewController {
         return ensurePlayerViewController()
@@ -73,10 +74,38 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         }
     }
 
-    func play() { playerVC?.playPlayback() }
-    func pause() { playerVC?.pausePlayback() }
-    func seekTo(positionMs: Int64) { playerVC?.seekToMs(positionMs) }
-    func seekBy(offsetMs: Int64) { playerVC?.seekByMs(offsetMs) }
+    func play() {
+        if let airPlayPlayer {
+            airPlayPlayerViewController?.setPlaybackIntended(true)
+            airPlayPlayer.play()
+        } else {
+            playerVC?.playPlayback()
+        }
+    }
+    func pause() {
+        if let airPlayPlayer {
+            airPlayPlayerViewController?.setPlaybackIntended(false)
+            airPlayPlayer.pause()
+        } else {
+            playerVC?.pausePlayback()
+        }
+    }
+    func seekTo(positionMs: Int64) {
+        if let airPlayPlayer, !didAttemptAirPlayRelay {
+            airPlayPlayer.seek(to: CMTime(value: max(0, positionMs), timescale: 1000))
+        } else if airPlayPlayer == nil {
+            playerVC?.seekToMs(positionMs)
+        }
+    }
+    func seekBy(offsetMs: Int64) {
+        if let airPlayPlayer, !didAttemptAirPlayRelay {
+            let seconds = airPlayPlayer.currentTime().seconds
+            let currentMs = seconds.isFinite ? Int64(max(0, seconds) * 1000) : 0
+            airPlayPlayer.seek(to: CMTime(value: max(0, currentMs + offsetMs), timescale: 1000))
+        } else if airPlayPlayer == nil {
+            playerVC?.seekByMs(offsetMs)
+        }
+    }
     func setSystemControlHandler(handler: PlayerSystemControlHandler?) {
         if let handler {
             ensurePlayerViewController().systemControlHandler = handler
@@ -208,9 +237,27 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         let knownDurationMs = max(0, playerVC?.durationMs ?? 0)
         airPlayKnownDurationMs = knownDurationMs
         airPlayLocalPlaybackWasPlaying = playerVC?.isPlayerPlaying == true
-        playerVC?.pausePlayback()
-
         let controller = AirPlayPlayerViewController()
+        playerVC?.setExternalPlaybackHandoffActive(true)
+        playerVC?.setExternalPlaybackControlHandlers(
+            isPlaying: { [weak controller] in controller?.playbackIsIntended ?? false },
+            setPlaying: { [weak self, weak controller] playing in
+                guard let player = self?.airPlayPlayer else { return }
+                controller?.setPlaybackIntended(playing)
+                if playing { player.play() } else { player.pause() }
+            },
+            seekTo: { [weak self] positionMs in
+                guard let self, !self.didAttemptAirPlayRelay else { return }
+                self.airPlayPlayer?.seek(to: CMTime(value: max(0, positionMs), timescale: 1000))
+            },
+            seekBy: { [weak self] offsetMs in
+                guard let self, !self.didAttemptAirPlayRelay, let player = self.airPlayPlayer else { return }
+                let seconds = player.currentTime().seconds
+                let currentMs = seconds.isFinite ? Int64(max(0, seconds) * 1000) : 0
+                player.seek(to: CMTime(value: max(0, currentMs + offsetMs), timescale: 1000))
+            }
+        )
+
         controller.modalPresentationStyle = .fullScreen
         if let title = airPlayTitle, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             controller.title = title
@@ -218,16 +265,20 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         controller.configure(
             displayTitle: airPlayTitle,
             knownDurationMs: knownDurationMs,
-            initialPositionMs: airPlayStartPositionMs
+            initialPositionMs: airPlayStartPositionMs,
+            playWhenReady: airPlayLocalPlaybackWasPlaying
         )
         controller.onDismiss = { [weak self] in
             self?.resetAirPlayPlayback()
         }
         controller.onExternalPlaybackEnded = { [weak self, weak controller] positionMs, wasPlaying in
             guard let self, let controller, self.airPlayPlayerViewController === controller else { return }
+            self.playerVC?.setExternalPlaybackHandoffActive(false)
             self.playerVC?.seekToMs(positionMs)
             controller.dismiss(animated: true) {
-                if wasPlaying { self.playerVC?.playPlayback() }
+                if wasPlaying, UIApplication.shared.applicationState == .active {
+                    self.playerVC?.playPlayback()
+                }
             }
         }
 
@@ -261,6 +312,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
 
     private func resetAirPlayPlayback() {
         clearAirPlayRouteSelection(resetSource: true)
+        endAirPlayBackgroundTask()
+        playerVC?.setExternalPlaybackHandoffActive(false)
+        playerVC?.setExternalPlaybackControlHandlers(isPlaying: nil, setPlaying: nil, seekTo: nil, seekBy: nil)
         airPlayPlayer?.pause()
         airPlayRelay?.stop()
         airPlayRelay = nil
@@ -296,6 +350,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         let player = AVPlayer(playerItem: item)
         player.allowsExternalPlayback = true
         player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+        player.automaticallyWaitsToMinimizeStalling = true
+        try? AVAudioSession.sharedInstance().setActive(true)
         if allowRelayFallback, airPlayKnownDurationMs > 0 {
             item.forwardPlaybackEndTime = CMTime(value: airPlayKnownDurationMs, timescale: 1000)
         }
@@ -307,7 +364,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
             guard item.status == .failed else { return }
             let message = self?.airPlayErrorMessage(item)
             DispatchQueue.main.async {
-                guard let self, let controller else { return }
+                guard let self, let controller,
+                      self.airPlayPlayerViewController === controller,
+                      self.airPlayPlayer?.currentItem === item else { return }
                 if allowRelayFallback, !self.didAttemptAirPlayRelay {
                     self.startAirPlayRelay(controller: controller, nativeError: message)
                 } else {
@@ -318,7 +377,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         if airPlayStartPositionMs > 0 {
             player.seek(to: CMTime(value: airPlayStartPositionMs, timescale: 1000))
         }
-        player.play()
+        controller.startPlaybackIfIntended()
     }
 
     private func startAirPlayRelay(controller: AirPlayPlayerViewController, nativeError: String?) {
@@ -329,6 +388,7 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         airPlayPlayer = nil
         controller.detachPlayer()
         controller.setPreparingRelay(true)
+        beginAirPlayBackgroundTask()
         do {
             let relay = try AirPlayHLSRelay(
                 sourceURL: sourceURL,
@@ -337,36 +397,40 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
             )
             airPlayRelay = relay
             relay.onFailure = { [weak self, weak controller, weak relay] error in
-                guard let self, let controller, self.airPlayRelay === relay else { return }
-                self.failAirPlayPlayback(
-                    controller: controller,
-                    message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                )
+                DispatchQueue.main.async {
+                    guard let self, let controller, self.airPlayRelay === relay else { return }
+                    self.failAirPlayPlayback(
+                        controller: controller,
+                        message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    )
+                }
             }
             InAppLogBridge.shared.info(
                 tag: "Player/AirPlay",
                 message: "Native playback failed; starting local HLS remux. \(nativeError ?? "")"
             )
             relay.start { [weak self, weak controller, weak relay] result in
-                guard let self, let controller, self.airPlayRelay === relay else { return }
-                controller.setPreparingRelay(false)
-                switch result {
-                case .success(let playlistURL):
-                    InAppLogBridge.shared.info(
-                        tag: "Player/AirPlay",
-                        message: "Local HLS relay ready at \(playlistURL.host ?? "phone")"
-                    )
-                    let relayStartPositionMs = self.airPlayStartPositionMs
-                    self.airPlayStartPositionMs = 0
-                    controller.setRelayTimelineOffset(positionMs: relayStartPositionMs)
-                    let item = AVPlayerItem(url: playlistURL)
-                    self.installAirPlayPlayer(item: item, controller: controller, allowRelayFallback: false)
-                case .failure(let error):
-                    let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    self.failAirPlayPlayback(
-                        controller: controller,
-                        message: [nativeError, relayMessage].compactMap { $0 }.joined(separator: "\n\n")
-                    )
+                DispatchQueue.main.async {
+                    guard let self, let controller, self.airPlayRelay === relay else { return }
+                    controller.setPreparingRelay(false)
+                    switch result {
+                    case .success(let playlistURL):
+                        InAppLogBridge.shared.info(
+                            tag: "Player/AirPlay",
+                            message: "Local HLS relay ready at \(playlistURL.host ?? "phone")"
+                        )
+                        let relayStartPositionMs = self.airPlayStartPositionMs
+                        self.airPlayStartPositionMs = 0
+                        controller.setRelayTimelineOffset(positionMs: relayStartPositionMs)
+                        let item = AVPlayerItem(url: playlistURL)
+                        self.installAirPlayPlayer(item: item, controller: controller, allowRelayFallback: false)
+                    case .failure(let error):
+                        let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        self.failAirPlayPlayback(
+                            controller: controller,
+                            message: [nativeError, relayMessage].compactMap { $0 }.joined(separator: "\n\n")
+                        )
+                    }
                 }
             }
         } catch {
@@ -381,11 +445,29 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
 
     private func failAirPlayPlayback(controller: AirPlayPlayerViewController, message: String?) {
         let shouldResumeLocalPlayback = airPlayLocalPlaybackWasPlaying
+        let resumePositionMs = controller.remotePositionMs
         controller.dismiss(animated: true) { [weak self] in
             guard let self else { return }
+            self.playerVC?.setExternalPlaybackHandoffActive(false)
+            self.playerVC?.seekToMs(resumePositionMs)
+            guard UIApplication.shared.applicationState == .active else { return }
             if shouldResumeLocalPlayback { self.playerVC?.playPlayback() }
             self.presentAirPlayError(message)
         }
+    }
+
+    private func beginAirPlayBackgroundTask() {
+        guard airPlayBackgroundTask == .invalid else { return }
+        airPlayBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "AirPlay handoff") { [weak self] in
+            self?.endAirPlayBackgroundTask()
+        }
+    }
+
+    private func endAirPlayBackgroundTask() {
+        guard airPlayBackgroundTask != .invalid else { return }
+        let task = airPlayBackgroundTask
+        airPlayBackgroundTask = .invalid
+        UIApplication.shared.endBackgroundTask(task)
     }
 
     private func airPlayErrorMessage(_ item: AVPlayerItem) -> String? {
@@ -595,17 +677,48 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         )
     }
 
-    // State - refreshes position from mpv on each call (polled from Kotlin every 250ms)
-    func getIsLoading() -> Bool { playerVC?.refreshPlaybackState(); return playerVC?.isPlayerLoading ?? true }
-    func getIsPlaying() -> Bool { return playerVC?.isPlayerPlaying ?? false }
-    func getIsEnded() -> Bool { return playerVC?.isPlayerEnded ?? false }
-    func getDurationMs() -> Int64 { return playerVC?.durationMs ?? 0 }
-    func getPositionMs() -> Int64 { return playerVC?.positionMs ?? 0 }
-    func getBufferedMs() -> Int64 { return playerVC?.bufferedMs ?? 0 }
-    func getPlaybackSpeed() -> Float { playerVC?.currentSpeed ?? 1.0 }
-    func getVideoWidth() -> Int32 { Int32(playerVC?.currentVideoWidth ?? 0) }
-    func getVideoHeight() -> Int32 { Int32(playerVC?.currentVideoHeight ?? 0) }
-    func getErrorMessage() -> String { playerVC?.currentErrorMessage ?? "" }
+    // State - refreshes position from the active player on each call (polled from Kotlin every 250ms)
+    func getIsLoading() -> Bool {
+        if let controller = airPlayPlayerViewController { return controller.remoteIsLoading }
+        playerVC?.refreshPlaybackState()
+        return playerVC?.isPlayerLoading ?? true
+    }
+    func getIsPlaying() -> Bool {
+        if let controller = airPlayPlayerViewController { return controller.remoteIsPlaying }
+        return playerVC?.isPlayerPlaying ?? false
+    }
+    func getIsEnded() -> Bool {
+        if let controller = airPlayPlayerViewController { return controller.remoteIsEnded }
+        return playerVC?.isPlayerEnded ?? false
+    }
+    func getDurationMs() -> Int64 {
+        if let controller = airPlayPlayerViewController { return controller.remoteDurationMs }
+        return playerVC?.durationMs ?? 0
+    }
+    func getPositionMs() -> Int64 {
+        if let controller = airPlayPlayerViewController { return controller.remotePositionMs }
+        return playerVC?.positionMs ?? 0
+    }
+    func getBufferedMs() -> Int64 {
+        if let controller = airPlayPlayerViewController { return controller.remoteBufferedMs }
+        return playerVC?.bufferedMs ?? 0
+    }
+    func getPlaybackSpeed() -> Float {
+        if let controller = airPlayPlayerViewController { return controller.remotePlaybackSpeed }
+        return playerVC?.currentSpeed ?? 1.0
+    }
+    func getVideoWidth() -> Int32 {
+        if let controller = airPlayPlayerViewController { return controller.remoteVideoWidth }
+        return Int32(playerVC?.currentVideoWidth ?? 0)
+    }
+    func getVideoHeight() -> Int32 {
+        if let controller = airPlayPlayerViewController { return controller.remoteVideoHeight }
+        return Int32(playerVC?.currentVideoHeight ?? 0)
+    }
+    func getErrorMessage() -> String {
+        if let controller = airPlayPlayerViewController { return controller.remoteErrorMessage }
+        return playerVC?.currentErrorMessage ?? ""
+    }
     func getMediaInfoJson() -> String { playerVC?.getMediaInfoJson() ?? "{}" }
     func getProperty(name: String) -> String { playerVC?.getString(name) ?? "" }
 
@@ -1150,10 +1263,45 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     private var hwdecBeforeBackground: String?
+    private var shouldResumeAfterBackground = false
+    private var externalPlaybackHandoffActive = false
+    private var externalPlaybackIsPlaying: (() -> Bool)?
+    private var externalPlaybackSetPlaying: ((Bool) -> Void)?
+    private var externalPlaybackSeekTo: ((Int64) -> Void)?
+    private var externalPlaybackSeekBy: ((Int64) -> Void)?
+
+    func setExternalPlaybackHandoffActive(_ active: Bool) {
+        externalPlaybackHandoffActive = active
+        if active {
+            pausePlayback()
+        } else if isPlayerPlaying {
+            publishNowPlayingForPlaybackSession()
+        }
+    }
+
+    func setExternalPlaybackControlHandlers(
+        isPlaying: (() -> Bool)?,
+        setPlaying: ((Bool) -> Void)?,
+        seekTo: ((Int64) -> Void)?,
+        seekBy: ((Int64) -> Void)?
+    ) {
+        externalPlaybackIsPlaying = isPlaying
+        externalPlaybackSetPlaying = setPlaying
+        externalPlaybackSeekTo = seekTo
+        externalPlaybackSeekBy = seekBy
+    }
+
+    var isSystemPlaybackPlaying: Bool {
+        if externalPlaybackHandoffActive, let externalPlaybackIsPlaying {
+            return externalPlaybackIsPlaying()
+        }
+        return isPlayerPlaying
+    }
 
     @objc private func enterBackground() {
         metalLayer.releasePendingDrawable()
         guard mpv != nil else { return }
+        shouldResumeAfterBackground = isPlayerPlaying
         let coreGeneration = mpvGeneration
         mpvQueue.async { [weak self] in
             guard let self, self.mpvGeneration == coreGeneration, self.mpv != nil else { return }
@@ -1178,7 +1326,9 @@ final class MPVPlayerViewController: UIViewController {
         let wasInPictureInPicture = pictureInPictureController?.enteredForeground() == true
         if wasInPictureInPicture { return }
         restoreBackgroundVideo()
-        playPlayback()
+        let shouldResume = shouldResumeAfterBackground && !externalPlaybackHandoffActive
+        shouldResumeAfterBackground = false
+        if shouldResume { playPlayback() }
     }
 
     @objc private func didBecomeActive() {
@@ -1339,21 +1489,33 @@ final class MPVPlayerViewController: UIViewController {
     // Requests from PiP and Now Playing go to the session controller when one handles them.
     func requestSystemPlaying(_ playing: Bool) {
         if systemControlHandler?.handleSetPlaying(playing: playing) == true { return }
+        if externalPlaybackHandoffActive, let externalPlaybackSetPlaying {
+            externalPlaybackSetPlaying(playing)
+            return
+        }
         if playing { playPlayback() } else { pausePlayback() }
     }
 
     func requestSystemSeekTo(_ positionMs: Int64) {
         if systemControlHandler?.handleSeekTo(positionMs: positionMs) == true { return }
+        if externalPlaybackHandoffActive, let externalPlaybackSeekTo {
+            externalPlaybackSeekTo(positionMs)
+            return
+        }
         seekToMs(positionMs)
     }
 
     func requestSystemSeekBy(_ offsetMs: Int64, exact: Bool = false) {
         if systemControlHandler?.handleSeekBy(offsetMs: offsetMs) == true { return }
+        if externalPlaybackHandoffActive, let externalPlaybackSeekBy {
+            externalPlaybackSeekBy(offsetMs)
+            return
+        }
         seekByMs(offsetMs, exact: exact)
     }
 
     func playPlayback() {
-        guard mpv != nil else { return }
+        guard mpv != nil, !externalPlaybackHandoffActive else { return }
         if !isEmbeddedPreviewMode {
             publishNowPlayingForPlaybackSession()
         }
@@ -2292,6 +2454,7 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     private func syncNowPlayingPlaybackState(isPlaying: Bool) {
+        guard !externalPlaybackHandoffActive else { return }
         let start = CACurrentMediaTime()
         pictureInPictureController?.updatePlaybackState()
         nowPlayingController.syncPlayback(
@@ -2415,7 +2578,7 @@ final class MPVPlayerViewController: UIViewController {
     }
 
     private func publishNowPlayingForPlaybackSession() {
-        guard !isEmbeddedPreviewMode else { return }
+        guard !isEmbeddedPreviewMode, !externalPlaybackHandoffActive else { return }
         activateAudioSessionForPlayback()
         if isViewLoaded, view.window != nil {
             becomeFirstResponder()
@@ -2966,9 +3129,36 @@ private final class AirPlayPlayerViewController: UIViewController {
     private var timelineOffsetSeconds: Double = 0
     private var isScrubbing = false
     private var playbackSpeed: Float = 1
+    private var playbackIntended = true
+    private var lastKnownPositionSeconds: Double = 0
+    var playbackIsIntended: Bool { playbackIntended }
+    var remoteIsLoading: Bool {
+        isPreparingRelay || trackedItem == nil || trackedItem?.status == .unknown || trackedPlayer?.timeControlStatus == .waitingToPlayAtSpecifiedRate
+    }
+    var remoteIsPlaying: Bool { playbackIntended && !playbackEnded }
+    var remoteIsEnded: Bool { playbackEnded }
+    var remoteDurationMs: Int64 { Int64(max(0, resolvedDurationSeconds) * 1000) }
+    var remotePositionMs: Int64 {
+        guard let player = trackedPlayer else { return Int64(max(0, lastKnownPositionSeconds) * 1000) }
+        return Int64(max(0, resolvedPositionSeconds(player: player)) * 1000)
+    }
+    var remoteBufferedMs: Int64 {
+        guard let item = trackedItem else { return remotePositionMs }
+        let endSeconds = item.loadedTimeRanges.compactMap { value -> Double? in
+            let end = CMTimeRangeGetEnd(value.timeRangeValue).seconds
+            return end.isFinite ? end : nil
+        }.max() ?? 0
+        return Int64(max(0, endSeconds + timelineOffsetSeconds) * 1000)
+    }
+    var remotePlaybackSpeed: Float { playbackSpeed }
+    var remoteVideoWidth: Int32 { Int32(max(0, trackedItem?.presentationSize.width ?? 0)) }
+    var remoteVideoHeight: Int32 { Int32(max(0, trackedItem?.presentationSize.height ?? 0)) }
+    var remoteErrorMessage: String { trackedItem?.error?.localizedDescription ?? "" }
     private var isPreparingRelay = false
     private var didBecomeExternallyActive = false
     private var isEndingSession = false
+    private var didStartPlayback = false
+    private var playbackEnded = false
     private weak var trackedPlayer: AVPlayer?
     private weak var trackedItem: AVPlayerItem?
     private var periodicTimeObserver: Any?
@@ -2976,39 +3166,43 @@ private final class AirPlayPlayerViewController: UIViewController {
     private var externalPlaybackObservation: NSKeyValueObservation?
     private var itemStatusObservation: NSKeyValueObservation?
     private var itemDurationObservation: NSKeyValueObservation?
-
-    private lazy var remoteScrollView: UIScrollView = {
-        let scrollView = UIScrollView()
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.alwaysBounceVertical = true
-        scrollView.showsVerticalScrollIndicator = false
-        return scrollView
-    }()
+    private var externalLossWorkItem: DispatchWorkItem?
+    private var externalLossRetryCount = 0
+    private var didBecomeActiveObserver: NSObjectProtocol?
+    private var routeChangeObserver: NSObjectProtocol?
+    private var interruptionObserver: NSObjectProtocol?
+    private var playbackStalledObserver: NSObjectProtocol?
+    private var playbackEndedObserver: NSObjectProtocol?
+    private var audioMenuElements: [UIMenuElement] = []
+    private var speedMenuElements: [UIMenuElement] = []
 
     private lazy var remoteContainer: UIView = {
         let view = UIView()
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.backgroundColor = UIColor(white: 0.08, alpha: 0.96)
-        view.layer.cornerRadius = 24
+        view.backgroundColor = UIColor(red: 0.055, green: 0.06, blue: 0.075, alpha: 0.98)
+        view.layer.cornerRadius = 22
         view.layer.cornerCurve = .continuous
+        view.layer.borderWidth = 1
+        view.layer.borderColor = UIColor.white.withAlphaComponent(0.08).cgColor
         return view
     }()
 
     private lazy var statusLabel: UILabel = {
         let label = UILabel()
-        label.font = .preferredFont(forTextStyle: .subheadline)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
         label.textColor = .systemGreen
-        label.textAlignment = .center
-        label.text = "Connecting to AirPlay…"
+        label.textAlignment = .left
+        label.text = "CONNECTING"
         return label
     }()
 
     private lazy var titleLabel: UILabel = {
         let label = UILabel()
-        label.font = .preferredFont(forTextStyle: .title2)
+        label.font = .preferredFont(forTextStyle: .headline)
         label.textColor = .white
-        label.textAlignment = .center
-        label.numberOfLines = 2
+        label.textAlignment = .left
+        label.numberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
         label.adjustsFontForContentSizeCategory = true
         return label
     }()
@@ -3048,8 +3242,7 @@ private final class AirPlayPlayerViewController: UIViewController {
     )
 
     private lazy var subtitlesButton = makeMenuButton(title: "Subtitles", systemName: "captions.bubble")
-    private lazy var audioButton = makeMenuButton(title: "Audio", systemName: "waveform")
-    private lazy var speedButton = makeMenuButton(title: "Speed", systemName: "speedometer")
+    private lazy var speedButton = makeMenuButton(title: "Options", systemName: "ellipsis.circle")
 
     private lazy var routePicker: AVRoutePickerView = {
         let picker = AVRoutePickerView()
@@ -3064,22 +3257,14 @@ private final class AirPlayPlayerViewController: UIViewController {
         return picker
     }()
 
-    private lazy var volumeView: MPVolumeView = {
-        let volume = MPVolumeView(frame: .zero)
-        volume.showsRouteButton = false
-        volume.showsVolumeSlider = true
-        return volume
-    }()
-
     private lazy var stopButton: UIButton = {
-        var configuration = UIButton.Configuration.filled()
-        configuration.title = "Stop playback"
-        configuration.image = UIImage(systemName: "stop.fill")
-        configuration.imagePadding = 8
-        configuration.baseBackgroundColor = .systemRed
-        configuration.baseForegroundColor = .white
-        configuration.cornerStyle = .large
+        var configuration = UIButton.Configuration.tinted()
+        configuration.image = UIImage(systemName: "xmark")
+        configuration.baseBackgroundColor = UIColor.systemRed.withAlphaComponent(0.28)
+        configuration.baseForegroundColor = .systemRed
+        configuration.cornerStyle = .capsule
         let button = UIButton(configuration: configuration)
+        button.accessibilityLabel = "Stop AirPlay"
         button.addTarget(self, action: #selector(stopTapped), for: .touchUpInside)
         return button
     }()
@@ -3100,11 +3285,19 @@ private final class AirPlayPlayerViewController: UIViewController {
         refreshInterface()
     }
 
-    func configure(displayTitle: String?, knownDurationMs: Int64, initialPositionMs: Int64) {
+    func configure(
+        displayTitle: String?,
+        knownDurationMs: Int64,
+        initialPositionMs: Int64,
+        playWhenReady: Bool
+    ) {
         let cleanedTitle = displayTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.displayTitle = cleanedTitle?.isEmpty == false ? cleanedTitle! : "Now Playing"
         knownDurationSeconds = max(0, Double(knownDurationMs) / 1000)
         timelineOffsetSeconds = 0
+        lastKnownPositionSeconds = max(0, Double(initialPositionMs) / 1000)
+        playbackIntended = playWhenReady
+        playbackEnded = false
         loadViewIfNeeded()
         titleLabel.text = self.displayTitle
         updateTimeline(positionSeconds: max(0, Double(initialPositionMs) / 1000))
@@ -3112,10 +3305,11 @@ private final class AirPlayPlayerViewController: UIViewController {
 
     func setRelayTimelineOffset(positionMs: Int64) {
         timelineOffsetSeconds = max(0, Double(positionMs) / 1000)
-        statusLabel.text = "Playing on TV through compatibility relay"
+        statusLabel.text = "TV • COMPATIBILITY MODE"
         timelineSlider.isEnabled = false
         rewindButton.isEnabled = false
         forwardButton.isEnabled = false
+        setSystemSeekCommandsEnabled(false)
     }
 
     func attach(player: AVPlayer, item: AVPlayerItem) {
@@ -3123,28 +3317,107 @@ private final class AirPlayPlayerViewController: UIViewController {
         trackedPlayer = player
         trackedItem = item
         self.player = player
+        player.defaultRate = playbackSpeed
+        setSystemSeekCommandsEnabled(timelineOffsetSeconds == 0)
         didBecomeExternallyActive = false
 
-        timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.refreshInterface() }
-        }
-        externalPlaybackObservation = player.observe(\.isExternalPlaybackActive, options: [.initial, .new]) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.handleExternalPlaybackChange() }
-        }
-        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] _, _ in
+        timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self, weak player] _, _ in
             DispatchQueue.main.async {
-                self?.refreshInterface()
-                self?.refreshMediaMenus()
+                guard let self, let player, self.trackedPlayer === player else { return }
+                if self.didStartPlayback {
+                    if player.timeControlStatus == .playing {
+                        self.playbackIntended = true
+                    } else if player.timeControlStatus == .paused, !self.isScrubbing, !self.isEndingSession {
+                        self.playbackIntended = false
+                    }
+                }
+                self.refreshInterface()
             }
         }
-        itemDurationObservation = item.observe(\.duration, options: [.initial, .new]) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.refreshInterface() }
+        externalPlaybackObservation = player.observe(\.isExternalPlaybackActive, options: [.initial, .new]) { [weak self, weak player] _, _ in
+            DispatchQueue.main.async {
+                guard let self, let player, self.trackedPlayer === player else { return }
+                self.handleExternalPlaybackChange()
+            }
+        }
+        itemStatusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self, weak item] _, _ in
+            DispatchQueue.main.async {
+                guard let self, let item, self.trackedItem === item else { return }
+                self.refreshInterface()
+                self.refreshMediaMenus()
+            }
+        }
+        itemDurationObservation = item.observe(\.duration, options: [.initial, .new]) { [weak self, weak item] _, _ in
+            DispatchQueue.main.async {
+                guard let self, let item, self.trackedItem === item else { return }
+                self.refreshInterface()
+            }
         }
         periodicTimeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
             queue: .main
+        ) { [weak self, weak player] _ in
+            guard let self, let player, self.trackedPlayer === player else { return }
+            self.refreshInterface()
+        }
+        didBecomeActiveObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
         ) { [weak self] _ in
-            self?.refreshInterface()
+            guard let self else { return }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            self.handleExternalPlaybackChange()
+            let routeUsesAirPlay = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+                $0.portType == .airPlay
+            }
+            if self.playbackIntended,
+               let player = self.trackedPlayer,
+               player.isExternalPlaybackActive || routeUsesAirPlay {
+                player.playImmediately(atRate: self.playbackSpeed)
+            }
+        }
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleExternalPlaybackChange()
+        }
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self, weak player] notification in
+            guard let self, let player, self.trackedPlayer === player else { return }
+            guard
+                let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                AVAudioSession.InterruptionType(rawValue: rawType) == .ended,
+                self.playbackIntended
+            else { return }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            player.playImmediately(atRate: self.playbackSpeed)
+        }
+        playbackStalledObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.playbackStalledNotification,
+            object: item,
+            queue: .main
+        ) { [weak self, weak player, weak item] _ in
+            guard let self, let player, let item,
+                  self.trackedPlayer === player,
+                  self.trackedItem === item,
+                  self.playbackIntended else { return }
+            player.playImmediately(atRate: self.playbackSpeed)
+        }
+        playbackEndedObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item,
+            queue: .main
+        ) { [weak self, weak item] _ in
+            guard let self, let item, self.trackedItem === item else { return }
+            self.playbackIntended = false
+            self.playbackEnded = true
+            self.refreshInterface()
         }
         refreshMediaMenus()
         refreshInterface()
@@ -3153,7 +3426,7 @@ private final class AirPlayPlayerViewController: UIViewController {
     func setPreparingRelay(_ preparing: Bool) {
         isPreparingRelay = preparing
         if preparing {
-            statusLabel.text = "Preparing compatible TV stream…"
+            statusLabel.text = "PREPARING TV STREAM"
             if preparingIndicator.superview == nil {
                 remoteContainer.addSubview(preparingIndicator)
                 NSLayoutConstraint.activate([
@@ -3172,89 +3445,76 @@ private final class AirPlayPlayerViewController: UIViewController {
 
     private func installRemoteInterface() {
         let overlay = view!
-        overlay.addSubview(remoteScrollView)
-        remoteScrollView.addSubview(remoteContainer)
+        overlay.addSubview(remoteContainer)
 
-        let timeRow = UIStackView(arrangedSubviews: [currentTimeLabel, UIView(), remainingTimeLabel])
-        timeRow.axis = .horizontal
+        let identity = UIStackView(arrangedSubviews: [statusLabel, titleLabel])
+        identity.axis = .vertical
+        identity.alignment = .fill
+        identity.spacing = 2
 
-        let transport = UIStackView(arrangedSubviews: [rewindButton, playPauseButton, forwardButton])
-        transport.axis = .horizontal
-        transport.alignment = .center
-        transport.distribution = .equalSpacing
-        transport.spacing = 28
+        let header = UIStackView(arrangedSubviews: [identity, UIView(), routePicker, stopButton])
+        header.axis = .horizontal
+        header.alignment = .center
+        header.spacing = 10
 
-        let optionButtons = UIStackView(arrangedSubviews: [subtitlesButton, audioButton, speedButton])
-        optionButtons.axis = .horizontal
-        optionButtons.alignment = .fill
-        optionButtons.distribution = .fillEqually
-        optionButtons.spacing = 10
+        let timeline = UIStackView(arrangedSubviews: [currentTimeLabel, timelineSlider, remainingTimeLabel])
+        timeline.axis = .horizontal
+        timeline.alignment = .center
+        timeline.spacing = 10
 
-        let outputLabel = UILabel()
-        outputLabel.text = "Output / Disconnect"
-        outputLabel.textColor = .white
-        outputLabel.font = .preferredFont(forTextStyle: .body)
-        let routeRow = UIStackView(arrangedSubviews: [outputLabel, UIView(), routePicker])
-        routeRow.axis = .horizontal
-        routeRow.alignment = .center
-
-        let volumeLabel = UILabel()
-        volumeLabel.text = "Volume"
-        volumeLabel.textColor = .secondaryLabel
-        volumeLabel.font = .preferredFont(forTextStyle: .caption1)
-
-        let stack = UIStackView(arrangedSubviews: [
-            statusLabel,
-            titleLabel,
-            timelineSlider,
-            timeRow,
-            transport,
-            optionButtons,
-            volumeLabel,
-            volumeView,
-            routeRow,
-            stopButton,
+        let controls = UIStackView(arrangedSubviews: [
+            subtitlesButton,
+            UIView(),
+            rewindButton,
+            playPauseButton,
+            forwardButton,
+            UIView(),
+            speedButton,
         ])
+        controls.axis = .horizontal
+        controls.alignment = .center
+        controls.distribution = .equalSpacing
+        controls.spacing = 8
+
+        let stack = UIStackView(arrangedSubviews: [header, timeline, controls])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
         stack.alignment = .fill
-        stack.spacing = 14
-        stack.setCustomSpacing(22, after: titleLabel)
-        stack.setCustomSpacing(24, after: timeRow)
-        stack.setCustomSpacing(24, after: transport)
+        stack.spacing = 18
         remoteContainer.addSubview(stack)
 
         let preferredContainerWidth = remoteContainer.widthAnchor.constraint(
-            equalTo: remoteScrollView.frameLayoutGuide.widthAnchor,
-            multiplier: 0.9
+            equalTo: overlay.safeAreaLayoutGuide.widthAnchor,
+            multiplier: 0.92
         )
         preferredContainerWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            remoteScrollView.leadingAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.leadingAnchor),
-            remoteScrollView.trailingAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.trailingAnchor),
-            remoteScrollView.topAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.topAnchor),
-            remoteScrollView.bottomAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.bottomAnchor),
-
-            remoteContainer.centerXAnchor.constraint(equalTo: remoteScrollView.frameLayoutGuide.centerXAnchor),
-            remoteContainer.topAnchor.constraint(equalTo: remoteScrollView.contentLayoutGuide.topAnchor, constant: 12),
-            remoteContainer.bottomAnchor.constraint(equalTo: remoteScrollView.contentLayoutGuide.bottomAnchor, constant: -12),
-            remoteScrollView.contentLayoutGuide.widthAnchor.constraint(equalTo: remoteScrollView.frameLayoutGuide.widthAnchor),
-            remoteContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 560),
-            remoteContainer.widthAnchor.constraint(lessThanOrEqualTo: remoteScrollView.frameLayoutGuide.widthAnchor, multiplier: 0.9),
+            remoteContainer.centerXAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.centerXAnchor),
+            remoteContainer.centerYAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.centerYAnchor),
+            remoteContainer.widthAnchor.constraint(lessThanOrEqualToConstant: 760),
+            remoteContainer.widthAnchor.constraint(lessThanOrEqualTo: overlay.safeAreaLayoutGuide.widthAnchor, multiplier: 0.92),
             preferredContainerWidth,
 
-            stack.leadingAnchor.constraint(equalTo: remoteContainer.leadingAnchor, constant: 22),
-            stack.trailingAnchor.constraint(equalTo: remoteContainer.trailingAnchor, constant: -22),
-            stack.topAnchor.constraint(equalTo: remoteContainer.topAnchor, constant: 22),
-            stack.bottomAnchor.constraint(equalTo: remoteContainer.bottomAnchor, constant: -22),
+            stack.leadingAnchor.constraint(equalTo: remoteContainer.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: remoteContainer.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: remoteContainer.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(equalTo: remoteContainer.bottomAnchor, constant: -18),
 
-            rewindButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            rewindButton.heightAnchor.constraint(equalToConstant: 56),
-            playPauseButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
-            playPauseButton.heightAnchor.constraint(equalToConstant: 72),
-            forwardButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 56),
-            forwardButton.heightAnchor.constraint(equalToConstant: 56),
-            stopButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+            identity.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            currentTimeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 45),
+            remainingTimeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 45),
+            rewindButton.widthAnchor.constraint(equalToConstant: 50),
+            rewindButton.heightAnchor.constraint(equalToConstant: 50),
+            playPauseButton.widthAnchor.constraint(equalToConstant: 62),
+            playPauseButton.heightAnchor.constraint(equalToConstant: 62),
+            forwardButton.widthAnchor.constraint(equalToConstant: 50),
+            forwardButton.heightAnchor.constraint(equalToConstant: 50),
+            subtitlesButton.widthAnchor.constraint(equalToConstant: 44),
+            subtitlesButton.heightAnchor.constraint(equalToConstant: 44),
+            speedButton.widthAnchor.constraint(equalToConstant: 44),
+            speedButton.heightAnchor.constraint(equalToConstant: 44),
+            stopButton.widthAnchor.constraint(equalToConstant: 36),
+            stopButton.heightAnchor.constraint(equalToConstant: 36),
         ])
     }
 
@@ -3289,23 +3549,21 @@ private final class AirPlayPlayerViewController: UIViewController {
 
     private func makeMenuButton(title: String, systemName: String) -> UIButton {
         var configuration = UIButton.Configuration.tinted()
-        configuration.title = title
         configuration.image = UIImage(systemName: systemName)
-        configuration.imagePlacement = .top
-        configuration.imagePadding = 5
         configuration.baseForegroundColor = .white
         configuration.baseBackgroundColor = UIColor.white.withAlphaComponent(0.14)
-        configuration.cornerStyle = .medium
+        configuration.cornerStyle = .capsule
         let button = UIButton(configuration: configuration)
+        button.accessibilityLabel = title
         button.showsMenuAsPrimaryAction = true
-        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 58).isActive = true
         return button
     }
 
     private func showUnavailableMediaMenus() {
         let unavailable = UIAction(title: "Not available in this stream", attributes: .disabled) { _ in }
         subtitlesButton.menu = UIMenu(title: "Subtitles", children: [unavailable])
-        audioButton.menu = UIMenu(title: "Audio", children: [unavailable])
+        audioMenuElements = [unavailable]
+        refreshOptionsMenu()
     }
 
     private func refreshMediaMenus() {
@@ -3364,11 +3622,13 @@ private final class AirPlayPlayerViewController: UIViewController {
                     self.installMediaMenus(for: item)
                 }
             }
-            audioButton.menu = UIMenu(title: "Audio", children: actions)
-            audioButton.isEnabled = !actions.isEmpty
+            audioMenuElements = actions.isEmpty
+                ? [UIAction(title: "Not available in this stream", attributes: .disabled) { _ in }]
+                : actions
         } else {
-            audioButton.isEnabled = false
+            audioMenuElements = [UIAction(title: "Not available in this stream", attributes: .disabled) { _ in }]
         }
+        refreshOptionsMenu()
     }
 
     private func refreshSpeedMenu() {
@@ -3385,7 +3645,23 @@ private final class AirPlayPlayerViewController: UIViewController {
                 self.refreshSpeedMenu()
             }
         }
-        speedButton.menu = UIMenu(title: "Playback Speed", children: actions)
+        speedMenuElements = actions
+        refreshOptionsMenu()
+    }
+
+    private func refreshOptionsMenu() {
+        guard isViewLoaded else { return }
+        let audioMenu = UIMenu(
+            title: "Audio",
+            image: UIImage(systemName: "waveform"),
+            children: audioMenuElements
+        )
+        let speedMenu = UIMenu(
+            title: "Playback Speed",
+            image: UIImage(systemName: "speedometer"),
+            children: speedMenuElements
+        )
+        speedButton.menu = UIMenu(title: "Options", children: [audioMenu, speedMenu])
     }
 
     private func refreshInterface() {
@@ -3397,23 +3673,29 @@ private final class AirPlayPlayerViewController: UIViewController {
         }
 
         playPauseButton.isEnabled = trackedItem?.status != .failed
-        let isPlaying = player.timeControlStatus == .playing
+        let isPlaying = playbackIntended
         let symbol = isPlaying ? "pause.fill" : "play.fill"
         playPauseButton.setImage(
             UIImage(systemName: symbol)?.withConfiguration(UIImage.SymbolConfiguration(pointSize: 34, weight: .semibold)),
             for: .normal
         )
         if !isPreparingRelay {
-            statusLabel.text = player.isExternalPlaybackActive ? "Playing on TV" : "Connecting to AirPlay…"
+            if player.isExternalPlaybackActive {
+                statusLabel.text = "PLAYING ON TV"
+            } else {
+                statusLabel.text = didBecomeExternallyActive ? "RECONNECTING" : "CONNECTING"
+            }
         }
         if !isScrubbing {
             updateTimeline(positionSeconds: resolvedPositionSeconds(player: player))
         }
+        updateSystemNowPlaying(player: player)
     }
 
     private func updateTimeline(positionSeconds: Double) {
         let duration = resolvedDurationSeconds
         let position = min(max(0, positionSeconds), duration > 0 ? duration : max(positionSeconds, 1))
+        lastKnownPositionSeconds = position
         currentTimeLabel.text = formatTime(position)
         if duration > 0 {
             timelineSlider.maximumValue = Float(duration)
@@ -3451,19 +3733,29 @@ private final class AirPlayPlayerViewController: UIViewController {
     }
 
     private func setRemoteControlsEnabled(_ enabled: Bool) {
-        [rewindButton, playPauseButton, forwardButton, subtitlesButton, audioButton, speedButton, stopButton]
+        [rewindButton, playPauseButton, forwardButton, subtitlesButton, speedButton]
             .forEach { $0.isEnabled = enabled }
+        stopButton.isEnabled = true
         let seekingEnabled = enabled && timelineOffsetSeconds == 0
         rewindButton.isEnabled = seekingEnabled
         forwardButton.isEnabled = seekingEnabled
         timelineSlider.isEnabled = seekingEnabled && resolvedDurationSeconds > 0
     }
 
+    private func setSystemSeekCommandsEnabled(_ enabled: Bool) {
+        let commands = MPRemoteCommandCenter.shared()
+        commands.skipForwardCommand.isEnabled = enabled
+        commands.skipBackwardCommand.isEnabled = enabled
+        commands.changePlaybackPositionCommand.isEnabled = enabled
+    }
+
     @objc private func playPauseTapped() {
         guard let player = trackedPlayer else { return }
-        if player.timeControlStatus == .playing {
+        if playbackIntended {
+            setPlaybackIntended(false)
             player.pause()
         } else {
+            setPlaybackIntended(true)
             player.playImmediately(atRate: playbackSpeed)
         }
         refreshInterface()
@@ -3499,31 +3791,119 @@ private final class AirPlayPlayerViewController: UIViewController {
 
     @objc private func stopTapped() {
         isEndingSession = true
+        playbackIntended = false
         trackedPlayer?.pause()
-        dismiss(animated: true)
+        if let onExternalPlaybackEnded {
+            onExternalPlaybackEnded(remotePositionMs, false)
+        } else {
+            dismiss(animated: true)
+        }
+    }
+
+    func setPlaybackIntended(_ playing: Bool) {
+        if playing {
+            didStartPlayback = true
+            if playbackEnded {
+                playbackEnded = false
+                trackedPlayer?.seek(to: .zero)
+            }
+        }
+        playbackIntended = playing
+        refreshInterface()
+    }
+
+    func startPlaybackIfIntended() {
+        guard playbackIntended, let player = trackedPlayer else { return }
+        didStartPlayback = true
+        player.playImmediately(atRate: playbackSpeed)
     }
 
     private func handleExternalPlaybackChange() {
         guard let player = trackedPlayer else { return }
         if player.isExternalPlaybackActive {
+            externalLossWorkItem?.cancel()
+            externalLossWorkItem = nil
+            externalLossRetryCount = 0
             didBecomeExternallyActive = true
-        } else if didBecomeExternallyActive, !isEndingSession {
-            isEndingSession = true
-            let positionMs = Int64(resolvedPositionSeconds(player: player) * 1000)
-            let wasPlaying = player.timeControlStatus == .playing
-            player.pause()
-            onExternalPlaybackEnded?(positionMs, wasPlaying)
-            return
+        } else if didBecomeExternallyActive,
+                  !isEndingSession,
+                  UIApplication.shared.applicationState == .active,
+                  externalLossWorkItem == nil {
+            let workItem = DispatchWorkItem { [weak self, weak player] in
+                guard let self, let player, self.trackedPlayer === player else { return }
+                self.externalLossWorkItem = nil
+                guard !self.isEndingSession, !player.isExternalPlaybackActive else { return }
+                guard UIApplication.shared.applicationState == .active else { return }
+                let routeStillUsesAirPlay = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+                    $0.portType == .airPlay
+                }
+                if routeStillUsesAirPlay, self.externalLossRetryCount < 3 {
+                    self.externalLossRetryCount += 1
+                    self.refreshInterface()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        self?.handleExternalPlaybackChange()
+                    }
+                    return
+                }
+                self.isEndingSession = true
+                let positionMs = Int64(self.resolvedPositionSeconds(player: player) * 1000)
+                let wasPlaying = self.playbackIntended
+                player.pause()
+                self.onExternalPlaybackEnded?(positionMs, wasPlaying)
+            }
+            externalLossWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0, execute: workItem)
         }
         refreshInterface()
     }
 
+    private func updateSystemNowPlaying(player: AVPlayer) {
+        let duration = resolvedDurationSeconds
+        let position = resolvedPositionSeconds(player: player)
+        let isPlaying = playbackIntended
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: displayTitle,
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.video.rawValue,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(playbackSpeed) : 0,
+            MPNowPlayingInfoPropertyIsLiveStream: duration <= 0,
+        ]
+        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+    }
+
     func detachPlayer() {
+        if let player = trackedPlayer {
+            lastKnownPositionSeconds = resolvedPositionSeconds(player: player)
+        }
         unbindPlayer()
         player = nil
     }
 
     private func unbindPlayer() {
+        externalLossWorkItem?.cancel()
+        externalLossWorkItem = nil
+        if let didBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(didBecomeActiveObserver)
+            self.didBecomeActiveObserver = nil
+        }
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+            self.routeChangeObserver = nil
+        }
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+            self.interruptionObserver = nil
+        }
+        if let playbackStalledObserver {
+            NotificationCenter.default.removeObserver(playbackStalledObserver)
+            self.playbackStalledObserver = nil
+        }
+        if let playbackEndedObserver {
+            NotificationCenter.default.removeObserver(playbackEndedObserver)
+            self.playbackEndedObserver = nil
+        }
         if let observer = periodicTimeObserver, let player = trackedPlayer {
             player.removeTimeObserver(observer)
         }
@@ -3535,6 +3915,9 @@ private final class AirPlayPlayerViewController: UIViewController {
         trackedPlayer = nil
         trackedItem = nil
         didBecomeExternallyActive = false
+        didStartPlayback = false
+        externalLossRetryCount = 0
+        setSystemSeekCommandsEnabled(true)
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -3543,6 +3926,8 @@ private final class AirPlayPlayerViewController: UIViewController {
         player?.pause()
         player = nil
         unbindPlayer()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
         onDismiss?()
     }
 
