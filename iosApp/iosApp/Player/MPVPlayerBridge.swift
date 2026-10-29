@@ -3318,6 +3318,7 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
         player.allowsExternalPlayback = true
         player.usesExternalPlaybackWhileExternalScreenIsActive = true
         attach(player: player, item: item)
+        setRemoteControlsEnabled(true)
         setPlaybackIntended(true)
         player.playImmediately(atRate: playbackSpeed)
     }
