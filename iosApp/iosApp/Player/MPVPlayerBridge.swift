@@ -25,7 +25,10 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
     private var airPlayKnownDurationMs: Int64 = 0
     private var airPlayTitle: String?
     private var airPlayLocalPlaybackWasPlaying = false
+    private var didRestartNativeAirPlay = false
     private var didAttemptAirPlayRelay = false
+    private var didRebuildAirPlayRelay = false
+    private var airPlayAttemptGeneration: UInt = 0
     private var airPlayRoutePickerView: AVRoutePickerView?
     private var airPlayRouteChangeObserver: NSObjectProtocol?
     private var airPlayRouteSelectionWorkItem: DispatchWorkItem?
@@ -134,7 +137,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         airPlaySourceHeaders = headers
         airPlayStartPositionMs = startPositionMs
         airPlayTitle = title
+        didRestartNativeAirPlay = false
         didAttemptAirPlayRelay = false
+        didRebuildAirPlayRelay = false
 
         if isAirPlayRouteSelected {
             beginAirPlayPlayback(url: url, headers: headers, presenter: presenter)
@@ -264,8 +269,9 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
             initialPositionMs: airPlayStartPositionMs,
             playWhenReady: airPlayLocalPlaybackWasPlaying
         )
-        controller.onDismiss = { [weak self] in
-            self?.resetAirPlayPlayback()
+        controller.onDismiss = { [weak self, weak controller] in
+            guard let self, let controller, self.airPlayPlayerViewController === controller else { return }
+            self.resetAirPlayPlayback()
         }
         controller.onExternalPlaybackEnded = { [weak self, weak controller] positionMs, wasPlaying in
             guard let self, let controller, self.airPlayPlayerViewController === controller else { return }
@@ -279,7 +285,8 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         }
 
         airPlayPlayerViewController = controller
-        presenter.present(controller, animated: true) {
+        presenter.present(controller, animated: true) { [weak self, weak controller] in
+            guard let self, let controller, self.airPlayPlayerViewController === controller else { return }
             self.startNativeAirPlayPlayer(url: url, headers: headers, controller: controller)
         }
     }
@@ -302,16 +309,20 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
             airPlayKnownDurationMs = 0
             airPlayTitle = nil
             airPlayLocalPlaybackWasPlaying = false
+            didRestartNativeAirPlay = false
             didAttemptAirPlayRelay = false
+            didRebuildAirPlayRelay = false
         }
     }
 
     private func resetAirPlayPlayback() {
+        airPlayAttemptGeneration &+= 1
         clearAirPlayRouteSelection(resetSource: true)
         endAirPlayBackgroundTask()
         playerVC?.setExternalPlaybackHandoffActive(false)
         playerVC?.setExternalPlaybackControlHandlers(isPlaying: nil, setPlaying: nil, seekTo: nil, seekBy: nil)
         airPlayPlayer?.pause()
+        airPlayPlayerViewController?.onPlaybackUnhealthy = nil
         airPlayRelay?.stop()
         airPlayRelay = nil
         airPlayPlayer = nil
@@ -330,17 +341,26 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
     private func startNativeAirPlayPlayer(
         url: URL,
         headers: [String: String],
-        controller: AirPlayPlayerViewController
+        controller: AirPlayPlayerViewController,
+        startPositionMs: Int64? = nil
     ) {
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
-        installAirPlayPlayer(item: AVPlayerItem(asset: asset), controller: controller, allowRelayFallback: true)
+        installAirPlayPlayer(
+            item: AVPlayerItem(asset: asset),
+            controller: controller,
+            allowRelayFallback: true,
+            startPositionMs: max(0, startPositionMs ?? airPlayStartPositionMs)
+        )
     }
 
     private func installAirPlayPlayer(
         item: AVPlayerItem,
         controller: AirPlayPlayerViewController,
-        allowRelayFallback: Bool
+        allowRelayFallback: Bool,
+        startPositionMs: Int64
     ) {
+        airPlayAttemptGeneration &+= 1
+        let attemptGeneration = airPlayAttemptGeneration
         airPlayStatusObservation = nil
         airPlayPlayer?.pause()
         let player = AVPlayer(playerItem: item)
@@ -356,90 +376,200 @@ final class MPVPlayerBridgeImpl: NSObject, NuvioPlayerBridge, AVRoutePickerViewD
         controller.player = player
         controller.attach(player: player, item: item)
         airPlayPlayer = player
-        airPlayStatusObservation = item.observe(\.status, options: [.new]) { [weak self, weak controller] item, _ in
+        controller.onPlaybackUnhealthy = { [weak self, weak controller, weak player, weak item] positionMs, reason in
+            guard let self, let controller, let player, let item,
+                  self.airPlayAttemptGeneration == attemptGeneration,
+                  self.airPlayPlayerViewController === controller,
+                  self.airPlayPlayer === player,
+                  player.currentItem === item else { return }
+            self.handleUnhealthyAirPlayPlayback(
+                controller: controller,
+                allowRelayFallback: allowRelayFallback,
+                positionMs: positionMs,
+                message: reason,
+                retryNativeFirst: allowRelayFallback
+            )
+        }
+        airPlayStatusObservation = item.observe(\.status, options: [.new]) { [weak self, weak controller, weak player] item, _ in
             guard item.status == .failed else { return }
             let message = self?.airPlayErrorMessage(item)
             DispatchQueue.main.async {
-                guard let self, let controller,
+                guard let self, let controller, let player,
+                      self.airPlayAttemptGeneration == attemptGeneration,
                       self.airPlayPlayerViewController === controller,
-                      self.airPlayPlayer?.currentItem === item else { return }
-                if allowRelayFallback, !self.didAttemptAirPlayRelay {
-                    self.startAirPlayRelay(controller: controller, nativeError: message)
-                } else {
-                    self.failAirPlayPlayback(controller: controller, message: message)
-                }
+                      self.airPlayPlayer === player,
+                      player.currentItem === item else { return }
+                self.handleUnhealthyAirPlayPlayback(
+                    controller: controller,
+                    allowRelayFallback: allowRelayFallback,
+                    positionMs: controller.remotePositionMs,
+                    message: message,
+                    retryNativeFirst: false
+                )
             }
         }
-        if airPlayStartPositionMs > 0 {
-            player.seek(to: CMTime(value: airPlayStartPositionMs, timescale: 1000))
+        if startPositionMs > 0 {
+            controller.seekToMsPreservingPlayback(startPositionMs)
+        } else {
+            controller.startPlaybackIfIntended()
         }
-        controller.startPlaybackIfIntended()
     }
 
-    private func startAirPlayRelay(controller: AirPlayPlayerViewController, nativeError: String?) {
-        guard !didAttemptAirPlayRelay, let sourceURL = airPlaySourceURL else { return }
-        didAttemptAirPlayRelay = true
+    private func handleUnhealthyAirPlayPlayback(
+        controller: AirPlayPlayerViewController,
+        allowRelayFallback: Bool,
+        positionMs: Int64,
+        message: String?,
+        retryNativeFirst: Bool = false
+    ) {
+        if allowRelayFallback,
+           retryNativeFirst,
+           !didRestartNativeAirPlay,
+           let source = airPlaySourceURL,
+           let url = URL(string: source) {
+            didRestartNativeAirPlay = true
+            InAppLogBridge.shared.info(
+                tag: "Player/AirPlay",
+                message: "AirPlay playback made no progress; recreating the receiver-safe player once. \(message ?? "")"
+            )
+            startNativeAirPlayPlayer(
+                url: url,
+                headers: airPlaySourceHeaders,
+                controller: controller,
+                startPositionMs: positionMs
+            )
+        } else if allowRelayFallback, !didAttemptAirPlayRelay {
+            startAirPlayRelay(
+                controller: controller,
+                reason: message,
+                startPositionMs: positionMs,
+                rebuilding: false
+            )
+        } else if !allowRelayFallback, !didRebuildAirPlayRelay {
+            startAirPlayRelay(
+                controller: controller,
+                reason: message,
+                startPositionMs: positionMs,
+                rebuilding: true
+            )
+        } else {
+            failAirPlayPlayback(controller: controller, message: message)
+        }
+    }
+
+    private func startAirPlayRelay(
+        controller: AirPlayPlayerViewController,
+        reason: String?,
+        startPositionMs: Int64,
+        rebuilding: Bool
+    ) {
+        guard let sourceURL = airPlaySourceURL else { return }
+        if rebuilding {
+            guard didAttemptAirPlayRelay, !didRebuildAirPlayRelay else { return }
+            didRebuildAirPlayRelay = true
+        } else {
+            guard !didAttemptAirPlayRelay else { return }
+            didAttemptAirPlayRelay = true
+        }
+        airPlayAttemptGeneration &+= 1
+        let attemptGeneration = airPlayAttemptGeneration
+        let relayStartPositionMs = max(0, startPositionMs)
+        airPlayStartPositionMs = relayStartPositionMs
         airPlayStatusObservation = nil
         airPlayPlayer?.pause()
         airPlayPlayer = nil
+        controller.onPlaybackUnhealthy = nil
         controller.detachPlayer()
         controller.setPreparingRelay(true)
+        airPlayRelay?.stop()
+        airPlayRelay = nil
         beginAirPlayBackgroundTask()
         do {
             let relay = try AirPlayHLSRelay(
                 sourceURL: sourceURL,
                 headers: airPlaySourceHeaders,
-                startPositionMs: airPlayStartPositionMs
+                startPositionMs: relayStartPositionMs
             )
             airPlayRelay = relay
             relay.onFailure = { [weak self, weak controller, weak relay] error in
                 DispatchQueue.main.async {
-                    guard let self, let controller, self.airPlayRelay === relay else { return }
-                    self.failAirPlayPlayback(
+                    guard let self, let controller,
+                          self.airPlayPlayerViewController === controller,
+                          self.airPlayRelay === relay else { return }
+                    self.handleUnhealthyAirPlayPlayback(
                         controller: controller,
+                        allowRelayFallback: false,
+                        positionMs: controller.remotePositionMs,
                         message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                     )
                 }
             }
             InAppLogBridge.shared.info(
                 tag: "Player/AirPlay",
-                message: "Native playback failed; starting local HLS remux. \(nativeError ?? "")"
+                message: "\(rebuilding ? "Relay playback stalled; rebuilding" : "Native playback failed; starting local HLS remux"). \(reason ?? "")"
             )
             relay.start { [weak self, weak controller, weak relay] result in
                 DispatchQueue.main.async {
-                    guard let self, let controller, self.airPlayRelay === relay else { return }
+                    guard let self, let controller,
+                          self.airPlayAttemptGeneration == attemptGeneration,
+                          self.airPlayPlayerViewController === controller,
+                          self.airPlayRelay === relay else { return }
                     controller.setPreparingRelay(false)
                     switch result {
                     case .success(let playlistURL):
+                        self.endAirPlayBackgroundTask()
                         InAppLogBridge.shared.info(
                             tag: "Player/AirPlay",
                             message: "Local HLS relay ready at \(playlistURL.host ?? "phone")"
                         )
-                        let relayStartPositionMs = self.airPlayStartPositionMs
                         self.airPlayStartPositionMs = 0
                         controller.setRelayTimelineOffset(positionMs: relayStartPositionMs)
                         let item = AVPlayerItem(url: playlistURL)
-                        self.installAirPlayPlayer(item: item, controller: controller, allowRelayFallback: false)
-                    case .failure(let error):
-                        let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                        self.failAirPlayPlayback(
+                        self.installAirPlayPlayer(
+                            item: item,
                             controller: controller,
-                            message: [nativeError, relayMessage].compactMap { $0 }.joined(separator: "\n\n")
+                            allowRelayFallback: false,
+                            startPositionMs: 0
                         )
+                    case .failure(let error):
+                        self.endAirPlayBackgroundTask()
+                        let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        let combinedMessage = [reason, relayMessage].compactMap { $0 }.joined(separator: "\n\n")
+                        if !self.didRebuildAirPlayRelay {
+                            self.startAirPlayRelay(
+                                controller: controller,
+                                reason: combinedMessage,
+                                startPositionMs: relayStartPositionMs,
+                                rebuilding: true
+                            )
+                        } else {
+                            self.failAirPlayPlayback(controller: controller, message: combinedMessage)
+                        }
                     }
                 }
             }
         } catch {
+            endAirPlayBackgroundTask()
             controller.setPreparingRelay(false)
             let relayMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            failAirPlayPlayback(
-                controller: controller,
-                message: [nativeError, relayMessage].compactMap { $0 }.joined(separator: "\n\n")
-            )
+            let combinedMessage = [reason, relayMessage].compactMap { $0 }.joined(separator: "\n\n")
+            if !didRebuildAirPlayRelay {
+                startAirPlayRelay(
+                    controller: controller,
+                    reason: combinedMessage,
+                    startPositionMs: relayStartPositionMs,
+                    rebuilding: true
+                )
+            } else {
+                failAirPlayPlayback(controller: controller, message: combinedMessage)
+            }
         }
     }
 
     private func failAirPlayPlayback(controller: AirPlayPlayerViewController, message: String?) {
+        guard airPlayPlayerViewController === controller else { return }
+        airPlayAttemptGeneration &+= 1
+        controller.prepareForDismissal()
         let shouldResumeLocalPlayback = airPlayLocalPlaybackWasPlaying
         let resumePositionMs = controller.remotePositionMs
         controller.dismiss(animated: true) { [weak self] in
@@ -3119,11 +3249,14 @@ enum NuvioPlayerRegistration {
 final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDelegate {
     var onDismiss: (() -> Void)?
     var onExternalPlaybackEnded: ((Int64, Bool) -> Void)?
+    var onPlaybackUnhealthy: ((Int64, String) -> Void)?
     var player: AVPlayer?
     private var displayTitle = "Now Playing"
     private var knownDurationSeconds: Double = 0
     private var timelineOffsetSeconds: Double = 0
     private var isScrubbing = false
+    private var isSeeking = false
+    private var isInterrupted = false
     private var playbackSpeed: Float = 1
     private var playbackIntended = true
     private var playbackIntentGeneration: UInt = 0
@@ -3171,6 +3304,13 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
     private var interruptionObserver: NSObjectProtocol?
     private var playbackStalledObserver: NSObjectProtocol?
     private var playbackEndedObserver: NSObjectProtocol?
+    private var playbackWatchdog: DispatchSourceTimer?
+    private var watchdogGeneration: UInt = 0
+    private var watchdogLastTickUptime: TimeInterval = 0
+    private var watchdogNoProgressSeconds: TimeInterval = 0
+    private var watchdogObservedPositionSeconds: Double = 0
+    private var watchdogSawProgress = false
+    private var watchdogWasPlaying = false
     private var audioMenuElements: [UIMenuElement] = []
     private var speedMenuElements: [UIMenuElement] = []
 #if DEBUG
@@ -3416,6 +3556,7 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
         player.defaultRate = playbackSpeed
         setSystemSeekCommandsEnabled(timelineOffsetSeconds == 0)
         didBecomeExternallyActive = false
+        startPlaybackWatchdog(player: player, item: item)
 
         timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self, weak player] _, _ in
             DispatchQueue.main.async {
@@ -3462,6 +3603,7 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
             queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            self.resetPlaybackWatchdogClock()
             try? AVAudioSession.sharedInstance().setActive(true)
             self.handleExternalPlaybackChange()
             let routeUsesAirPlay = AVAudioSession.sharedInstance().currentRoute.outputs.contains {
@@ -3486,13 +3628,18 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
             queue: .main
         ) { [weak self, weak player] notification in
             guard let self, let player, self.trackedPlayer === player else { return }
-            guard
-                let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                AVAudioSession.InterruptionType(rawValue: rawType) == .ended,
-                self.playbackIntended
-            else { return }
-            try? AVAudioSession.sharedInstance().setActive(true)
-            player.playImmediately(atRate: self.playbackSpeed)
+            guard let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: rawType) else { return }
+            if type == .began {
+                self.isInterrupted = true
+                self.resetPlaybackWatchdogClock(resetBudget: true)
+            } else {
+                self.isInterrupted = false
+                self.resetPlaybackWatchdogClock(resetBudget: true)
+                guard self.playbackIntended else { return }
+                try? AVAudioSession.sharedInstance().setActive(true)
+                player.playImmediately(atRate: self.playbackSpeed)
+            }
         }
         playbackStalledObserver = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.playbackStalledNotification,
@@ -3969,19 +4116,24 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
         let duration = resolvedDurationSeconds
         let target = min(max(0, requestedTarget), duration > 0 ? duration : max(0, requestedTarget))
         let shouldResume = playbackIntended
+        isSeeking = true
+        resetPlaybackWatchdogClock(resetBudget: true)
         seekGeneration &+= 1
         let expectedPlaybackIntentGeneration = playbackIntentGeneration
         let expectedSeekGeneration = seekGeneration
         player.seek(to: CMTime(seconds: target, preferredTimescale: 1000)) { [weak self, weak player] finished in
             DispatchQueue.main.async {
+                guard let self,
+                    let player,
+                    self.trackedPlayer === player,
+                    self.seekGeneration == expectedSeekGeneration
+                else { return }
+                self.isSeeking = false
+                self.resetPlaybackWatchdogClock(resetBudget: true)
                 guard
                     finished,
                     shouldResume,
-                    let self,
-                    let player,
-                    self.trackedPlayer === player,
                     self.playbackIntentGeneration == expectedPlaybackIntentGeneration,
-                    self.seekGeneration == expectedSeekGeneration,
                     !self.isEndingSession,
                     !self.playbackEnded
                 else { return }
@@ -4018,6 +4170,11 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
         }
     }
 
+    func prepareForDismissal() {
+        isEndingSession = true
+        stopPlaybackWatchdog()
+    }
+
     func setPlaybackIntended(_ playing: Bool) {
         playbackIntentGeneration &+= 1
         if playing {
@@ -4028,6 +4185,7 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
             }
         }
         playbackIntended = playing
+        resetPlaybackWatchdogClock(resetBudget: true)
         refreshInterface()
     }
 
@@ -4092,6 +4250,80 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
         MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
     }
 
+    private func startPlaybackWatchdog(player: AVPlayer, item: AVPlayerItem) {
+        watchdogGeneration &+= 1
+        let generation = watchdogGeneration
+        watchdogLastTickUptime = ProcessInfo.processInfo.systemUptime
+        watchdogNoProgressSeconds = 0
+        watchdogObservedPositionSeconds = resolvedPositionSeconds(player: player)
+        watchdogSawProgress = false
+        watchdogWasPlaying = false
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(200))
+        timer.setEventHandler { [weak self, weak player, weak item] in
+            guard let self, let player, let item,
+                  self.watchdogGeneration == generation,
+                  self.trackedPlayer === player,
+                  self.trackedItem === item else { return }
+            self.checkPlaybackHealth(player: player, item: item)
+        }
+        playbackWatchdog = timer
+        timer.resume()
+    }
+
+    private func checkPlaybackHealth(player: AVPlayer, item: AVPlayerItem) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = max(0, now - watchdogLastTickUptime)
+        watchdogLastTickUptime = now
+
+        guard playbackIntended,
+              !isScrubbing,
+              !isSeeking,
+              !playbackEnded,
+              !isInterrupted,
+              !isEndingSession,
+              UIApplication.shared.applicationState == .active else {
+            watchdogNoProgressSeconds = 0
+            watchdogObservedPositionSeconds = resolvedPositionSeconds(player: player)
+            watchdogWasPlaying = player.timeControlStatus == .playing
+            return
+        }
+
+        let position = resolvedPositionSeconds(player: player)
+        let isPlaying = player.timeControlStatus == .playing
+        if isPlaying, watchdogWasPlaying, position > watchdogObservedPositionSeconds + 0.25 {
+            watchdogSawProgress = true
+            watchdogNoProgressSeconds = 0
+        } else {
+            watchdogNoProgressSeconds += elapsed
+        }
+        watchdogObservedPositionSeconds = position
+        watchdogWasPlaying = isPlaying
+
+        let timeout: TimeInterval = watchdogSawProgress ? 30 : 20
+        guard watchdogNoProgressSeconds >= timeout else { return }
+        stopPlaybackWatchdog()
+        let phase = watchdogSawProgress ? "AirPlay playback stopped making progress." : "AirPlay playback did not start."
+        onPlaybackUnhealthy?(remotePositionMs, phase)
+    }
+
+    private func resetPlaybackWatchdogClock(resetBudget: Bool = false) {
+        watchdogLastTickUptime = ProcessInfo.processInfo.systemUptime
+        if resetBudget { watchdogNoProgressSeconds = 0 }
+        if let player = trackedPlayer {
+            watchdogObservedPositionSeconds = resolvedPositionSeconds(player: player)
+            watchdogWasPlaying = player.timeControlStatus == .playing
+        }
+    }
+
+    private func stopPlaybackWatchdog() {
+        watchdogGeneration &+= 1
+        playbackWatchdog?.setEventHandler {}
+        playbackWatchdog?.cancel()
+        playbackWatchdog = nil
+    }
+
     func detachPlayer() {
         if let player = trackedPlayer {
             lastKnownPositionSeconds = resolvedPositionSeconds(player: player)
@@ -4101,6 +4333,7 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
     }
 
     private func unbindPlayer() {
+        stopPlaybackWatchdog()
         externalLossWorkItem?.cancel()
         externalLossWorkItem = nil
         if let didBecomeActiveObserver {
@@ -4133,6 +4366,8 @@ final class AirPlayPlayerViewController: UIViewController, AVRoutePickerViewDele
         itemDurationObservation = nil
         trackedPlayer = nil
         trackedItem = nil
+        isSeeking = false
+        isInterrupted = false
         didBecomeExternallyActive = false
         didStartPlayback = false
         externalLossRetryCount = 0

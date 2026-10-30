@@ -265,6 +265,34 @@ class MediaBrowserRequestTest {
     }
 
     @Test
+    fun airPlayRequestsReceiverSafeHlsForTheExactSource() = runTest {
+        val http = TestHttp {
+            """{"PlaySessionId": "ps1", "MediaSources": [{"Id": "ms1", "TranscodingUrl": "/videos/i1/master.m3u8"}]}"""
+        }
+        val jellyfin = JellyfinProvider(http.client)
+        val target = ServerPlaybackTarget(ServerItemRef("cabc", "i1"), mediaSourceId = "ms1")
+
+        jellyfin.preparePlayback(
+            session("jellyfin", "https://media.example.com/jellyfin"),
+            ServerPlaybackRequest(target, ServerPlayerCapabilities(directPlayAll = false, allowDirectPlay = false, receiverSafeHls = true)),
+        )
+
+        val request = http.requests.single()
+        assertEquals("ms1", request.url.parameters["mediaSourceId"])
+        assertEquals("20000000", request.url.parameters["maxStreamingBitrate"])
+        assertEquals("false", request.url.parameters["enableDirectPlay"])
+        assertEquals("true", request.url.parameters["enableDirectStream"])
+        assertEquals("true", request.url.parameters["enableTranscoding"])
+        assertEquals("true", request.url.parameters["allowVideoStreamCopy"])
+        assertEquals("true", request.url.parameters["allowAudioStreamCopy"])
+        assertTrue(request.text.contains("\"Name\":\"Nuvio AirPlay\""))
+        assertTrue(request.text.contains("\"MaxStreamingBitrate\":20000000"))
+        assertTrue(request.text.contains("\"DirectPlayProfiles\":[]"))
+        assertTrue(request.text.contains("\"VideoCodec\":\"h264\",\"AudioCodec\":\"aac\""))
+        assertTrue(request.text.contains("\"MaxAudioChannels\":\"2\""))
+    }
+
+    @Test
     fun embyPreparesAndReportsPlaybackThroughApiRoot() = runTest {
         val http = TestHttp { request ->
             if (request.url.encodedPath.endsWith("/PlaybackInfo")) {

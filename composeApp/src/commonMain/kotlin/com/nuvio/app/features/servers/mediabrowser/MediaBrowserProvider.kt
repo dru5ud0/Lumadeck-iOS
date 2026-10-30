@@ -349,13 +349,19 @@ internal abstract class MediaBrowserProvider(
         request: ServerPlaybackRequest,
     ): ServerPlaybackSession {
         val itemId = request.target.item.itemId
+        val receiverSafeHls = request.capabilities.receiverSafeHls
+        val maxStreamingBitrate = if (receiverSafeHls) AIRPLAY_MAX_STREAMING_BITRATE else MAX_STREAMING_BITRATE
         val body = PlaybackInfoRequest(
             userId = session.userId,
             mediaSourceId = request.target.mediaSourceId,
             audioStreamIndex = request.audioStreamIndex,
             subtitleStreamIndex = request.subtitleStreamIndex,
-            maxStreamingBitrate = MAX_STREAMING_BITRATE,
-            enableDirectPlay = request.capabilities.allowDirectPlay,
+            maxStreamingBitrate = maxStreamingBitrate,
+            enableDirectPlay = request.capabilities.allowDirectPlay && !receiverSafeHls,
+            enableDirectStream = true,
+            enableTranscoding = true,
+            allowVideoStreamCopy = true,
+            allowAudioStreamCopy = true,
             deviceProfile = deviceProfile(request.capabilities),
         )
         val response = client.execute(
@@ -370,6 +376,10 @@ internal abstract class MediaBrowserProvider(
                 "subtitleStreamIndex" to body.subtitleStreamIndex?.toString(),
                 "maxStreamingBitrate" to body.maxStreamingBitrate.toString(),
                 "enableDirectPlay" to body.enableDirectPlay.toString(),
+                "enableDirectStream" to body.enableDirectStream.toString(),
+                "enableTranscoding" to body.enableTranscoding.toString(),
+                "allowVideoStreamCopy" to body.allowVideoStreamCopy.toString(),
+                "allowAudioStreamCopy" to body.allowAudioStreamCopy.toString(),
             ),
             body = client.json.encodeToString(PlaybackInfoRequest.serializer(), body),
         )
@@ -389,9 +399,12 @@ internal abstract class MediaBrowserProvider(
             "NotAllowed" -> throw ServerException(ServerFailure.FORBIDDEN)
             else -> throw ServerException(ServerFailure.UNSUPPORTED, info.errorCode)
         }
-        val source = info.mediaSources.firstOrNull { it.id == request.target.mediaSourceId }
-            ?: info.mediaSources.firstOrNull { !it.isPlaceholder }
-            ?: throw ServerException(ServerFailure.NOT_FOUND)
+        val requestedSourceId = request.target.mediaSourceId
+        val source = if (requestedSourceId != null) {
+            info.mediaSources.firstOrNull { it.id == requestedSourceId }
+        } else {
+            info.mediaSources.firstOrNull { !it.isPlaceholder }
+        } ?: throw ServerException(ServerFailure.NOT_FOUND)
         val (url, method) = when {
             source.supportsDirectPlay && request.capabilities.allowDirectPlay -> buildUrl(
                 session.apiRoot,
@@ -552,12 +565,12 @@ internal abstract class MediaBrowserProvider(
     }
 
     private fun deviceProfile(capabilities: ServerPlayerCapabilities) = DeviceProfile(
-        name = "Nuvio",
-        maxStreamingBitrate = MAX_STREAMING_BITRATE,
-        directPlayProfiles = if (capabilities.directPlayAll && capabilities.allowDirectPlay) {
-            listOf(DirectPlayProfile())
-        } else {
-            listOf(
+        name = if (capabilities.receiverSafeHls) "Nuvio AirPlay" else "Nuvio",
+        maxStreamingBitrate = if (capabilities.receiverSafeHls) AIRPLAY_MAX_STREAMING_BITRATE else MAX_STREAMING_BITRATE,
+        directPlayProfiles = when {
+            capabilities.receiverSafeHls -> emptyList()
+            capabilities.directPlayAll && capabilities.allowDirectPlay -> listOf(DirectPlayProfile())
+            else -> listOf(
                 DirectPlayProfile(
                     container = "mp4,m4v,mkv,webm,mov",
                     videoCodec = "h264,hevc,vp8,vp9,av1",
@@ -566,12 +579,22 @@ internal abstract class MediaBrowserProvider(
             )
         },
         transcodingProfiles = listOf(
-            TranscodingProfile(
-                container = "ts",
-                videoCodec = "hevc,h264",
-                audioCodec = "aac,mp3,ac3",
-                protocol = "hls",
-            ),
+            if (capabilities.receiverSafeHls) {
+                TranscodingProfile(
+                    container = "ts",
+                    videoCodec = "h264",
+                    audioCodec = "aac",
+                    protocol = "hls",
+                    maxAudioChannels = "2",
+                )
+            } else {
+                TranscodingProfile(
+                    container = "ts",
+                    videoCodec = "hevc,h264",
+                    audioCodec = "aac,mp3,ac3",
+                    protocol = "hls",
+                )
+            },
         ),
         subtitleProfiles = EMBEDDED_SUBTITLES.map { SubtitleProfile(format = it, method = "Embed") } +
             TEXT_SUBTITLES.map { SubtitleProfile(format = it, method = "External") } +
@@ -592,6 +615,7 @@ internal abstract class MediaBrowserProvider(
     private companion object {
         const val API_KEY = "api_key"
         const val MAX_STREAMING_BITRATE = 1_000_000_000L
+        const val AIRPLAY_MAX_STREAMING_BITRATE = 20_000_000L
         const val LIST_FIELDS = "Overview,Genres,ProviderIds,PremiereDate"
         const val DETAIL_FIELDS = "Overview,Genres,ProviderIds,People,Studios,PremiereDate,EndDate"
         val TEXT_SUBTITLES = listOf("srt", "subrip", "ass", "ssa", "vtt", "webvtt")

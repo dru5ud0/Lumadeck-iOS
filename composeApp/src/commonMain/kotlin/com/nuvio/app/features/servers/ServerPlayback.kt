@@ -77,17 +77,32 @@ internal object ServerPlayback {
     fun session(url: String?): ServerPlaybackSession? = url?.let { synchronized(lock) { active[it] } }?.playback
 
     /**
-     * Returns the exact active server stream for an AirPlay handoff.
+     * Prepares the exact active media source as receiver-safe HLS for AirPlay.
      *
-     * The selected media source is part of the user's playback choice. Re-querying
-     * the server and choosing a more Apple-compatible candidate can silently hand
-     * a different file (or incorrectly grouped episode) to AirPlay. AVPlayer tries
-     * this source directly and the iOS bridge can remux the same source when needed.
+     * The selected media source is part of the user's playback choice. This pins
+     * negotiation to that source instead of rescoring candidates, while allowing
+     * the server to normalize the stream for receivers that cannot replay private
+     * request headers or the source container reliably.
      */
     suspend fun airPlaySource(url: String?): ServerPlaybackSession? {
         val current = url?.let { synchronized(lock) { active[it] } } ?: return null
-        log.i { "Using ${current.label} source ${current.playback.mediaSourceId} for AirPlay" }
-        return current.playback
+        val mediaSourceId = current.playback.mediaSourceId
+        val request = ServerPlaybackRequest(
+            target = current.playback.target.copy(mediaSourceId = mediaSourceId),
+            capabilities = capabilities().copy(
+                directPlayAll = false,
+                allowDirectPlay = false,
+                receiverSafeHls = true,
+            ),
+            audioStreamIndex = current.playback.audioTracks.selectedIndex(),
+            subtitleStreamIndex = current.playback.burnInSubtitles.selectedIndex(),
+        )
+        val playback = current.provider.preparePlayback(current.session, request)
+        if (playback.mediaSourceId != mediaSourceId) {
+            throw ServerException(ServerFailure.NOT_FOUND, "AirPlay media source changed")
+        }
+        log.i { "Prepared ${current.label} source $mediaSourceId as receiver-safe HLS for AirPlay" }
+        return playback
     }
 
     suspend fun newerResumePositionMs(url: String?, savedAtEpochMs: Long?): Long? {

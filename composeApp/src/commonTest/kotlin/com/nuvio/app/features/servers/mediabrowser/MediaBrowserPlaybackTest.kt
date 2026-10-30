@@ -100,6 +100,19 @@ class MediaBrowserPlaybackTest {
         assertEquals(ServerFailure.UNSUPPORTED, unsupported.failure)
     }
 
+    @Test
+    fun rejectsAResponseThatSubstitutesAnotherMediaSource() {
+        val error = assertFailsWith<ServerException> {
+            jellyfin.playbackSession(
+                session,
+                request,
+                info("""{"Id": "ms2", "SupportsDirectPlay": true}"""),
+                deviceId = "d1",
+            )
+        }
+        assertEquals(ServerFailure.NOT_FOUND, error.failure)
+    }
+
     private val embySession = ServerSession(
         connection = session.connection.copy(providerId = "emby", address = "https://media.example.com"),
         token = "secret",

@@ -53,6 +53,7 @@ final class AirPlayHLSRelay {
 
     private static let targetSegmentDuration = 6.0
     private static let minimumSegmentsBeforePlayback = 3
+    private static let mediaStartupTimeout = 20.0
     private static let maximumSegmentsAhead = 8
     private static let maximumSegmentsBehind = 60
     private static let ioTimeoutMicroseconds = "15000000"
@@ -106,6 +107,12 @@ final class AirPlayHLSRelay {
                 self.abortFlag.set()
                 self.listener?.cancel()
                 self.finishStart(.failure(RelayError.listenerFailed("timed out waiting for the local server")))
+            }
+            self.stateQueue.asyncAfter(deadline: .now() + Self.mediaStartupTimeout) { [weak self] in
+                guard let self, !self.didCompleteStart else { return }
+                self.abortFlag.set()
+                self.listener?.cancel()
+                self.finishStart(.failure(RelayError.outputFailed("timed out waiting for media segments")))
             }
             self.remuxQueue.async { [weak self] in
                 self?.runRemux()
@@ -168,8 +175,12 @@ final class AirPlayHLSRelay {
     }
 
     private func maybeFinishStart() {
-        guard !didCompleteStart,
-              segments.count >= Self.minimumSegmentsBeforePlayback,
+        guard !didCompleteStart else { return }
+        if completed && segments.isEmpty {
+            finishStart(.failure(RelayError.outputFailed("the source produced no playable media segments")))
+            return
+        }
+        guard segments.count >= Self.minimumSegmentsBeforePlayback || (completed && !segments.isEmpty),
               let listenerURL else { return }
         finishStart(.success(listenerURL))
     }

@@ -131,19 +131,22 @@ class ServerPlaybackTest {
     }
 
     @Test
-    fun airPlayPreservesTheActiveMediaSource() = runTest {
-        val provider = FakeServerProvider()
+    fun airPlayPreparesReceiverSafeHlsForTheActiveMediaSource() = runTest {
+        val provider = FakeServerProvider(transcodes = true)
         val connection = installFakeServer(provider)
         val selected = ServerStreams.candidates(ServerItemRef(connection.id, "42")).single()
         val prepared = ServerPlayback.prepare(selected)
         val url = assertNotNull(prepared.playableDirectUrl)
-        val requestCount = provider.playbackRequests.size
+        val original = assertNotNull(ServerPlayback.session(url))
 
         val airPlay = assertNotNull(ServerPlayback.airPlaySource(url))
 
-        assertEquals(url, airPlay.url)
-        assertEquals(selected.serverTarget, airPlay.target)
-        assertEquals(requestCount, provider.playbackRequests.size)
+        val request = provider.playbackRequests.last()
+        assertEquals(original.mediaSourceId, request.target.mediaSourceId)
+        assertEquals(original.mediaSourceId, airPlay.mediaSourceId)
+        assertFalse(request.capabilities.allowDirectPlay)
+        assertFalse(request.capabilities.directPlayAll)
+        assertTrue(request.capabilities.receiverSafeHls)
         ServerPlayback.stop(url)
     }
 
